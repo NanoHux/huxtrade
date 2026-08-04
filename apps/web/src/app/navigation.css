@@ -1,0 +1,18 @@
+.sidebar nav a:first-child:not(.active) {
+  background: transparent;
+  color: #9dabb0;
+  border-color: transparent;
+}
+
+.sidebar nav a.active {
+  background: linear-gradient(90deg, #15372f, #10231f);
+  color: var(--green);
+  border: 1px solid #1d4c3e;
+}
+
+.panelHead h2 { white-space: nowrap; flex: 0 0 auto; }
+.panelHead small { text-align: right; }
+
+@media (max-width: 700px) {
+  .panelHead { align-items: flex-start; gap: 12px; }
+}

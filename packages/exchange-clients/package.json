@@ -1,0 +1,14 @@
+{
+  "name": "@huxtrade/exchange-clients",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@huxtrade/config": "workspace:*",
+    "@huxtrade/indicators": "workspace:*",
+    "@huxtrade/shared-types": "workspace:*",
+    "@huxtrade/strategy-engine": "workspace:*"
+  },
+  "scripts": { "typecheck": "tsc --noEmit -p tsconfig.json" }
+}
+

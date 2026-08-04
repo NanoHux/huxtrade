@@ -1,0 +1,12 @@
+{
+  "name": "@huxtrade/strategy-engine",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": {
+    "@huxtrade/config": "workspace:*",
+    "@huxtrade/shared-types": "workspace:*"
+  },
+  "scripts": { "typecheck": "tsc --noEmit -p tsconfig.json" }
+}
+

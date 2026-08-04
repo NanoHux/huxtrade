@@ -1,0 +1,13 @@
+{
+  "name": "@huxtrade/database",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": { "@huxtrade/config": "workspace:*", "pg": "^8.16.0" },
+  "scripts": {
+    "migrate": "tsx src/migrate.ts",
+    "seed": "tsx src/seed.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json"
+  }
+}
+

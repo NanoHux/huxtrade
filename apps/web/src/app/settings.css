@@ -1,0 +1,4 @@
+.notificationGrid { display: grid; grid-template-columns: repeat(2, minmax(220px, 1fr)); gap: 8px 18px; }
+.notificationToggle { display: flex; align-items: center; justify-content: space-between; padding: 11px 12px; border: 1px solid var(--line); background: #09151a; color: #b9c5c2; font-size: 11px; }
+.notificationToggle input { accent-color: var(--green); }
+@media (max-width: 700px) { .notificationGrid { grid-template-columns: 1fr; } }

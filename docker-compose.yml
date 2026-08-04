@@ -1,0 +1,98 @@
+services:
+  postgres:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: "${POSTGRES_DB:-huxtrade}"
+      POSTGRES_USER: "${POSTGRES_USER:-huxtrade}"
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:-huxtrade}"
+    ports: ["127.0.0.1:5432:5432"]
+    volumes: ["postgres_data:/var/lib/postgresql/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U huxtrade"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    build: .
+    env_file: .env
+    command: ["pnpm", "db:migrate"]
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  api:
+    build:
+      context: .
+      args: { APP_FILTER: "@huxtrade/api" }
+    env_file: .env
+    volumes: ["./.env:/app/.env"]
+    ports: ["127.0.0.1:4000:4000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:4000/health').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  web:
+    build:
+      context: .
+      args:
+        APP_FILTER: "@huxtrade/web"
+        NEXT_PUBLIC_API_URL: "${NEXT_PUBLIC_API_URL:-http://localhost:4000}"
+    env_file: .env
+    ports: ["127.0.0.1:3000:3000"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000').then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  market-collector:
+    build:
+      context: .
+      args: { APP_FILTER: "@huxtrade/market-collector" }
+    env_file: .env
+    volumes: ["./.env:/app/.env"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+  signal-engine:
+    build:
+      context: .
+      args: { APP_FILTER: "@huxtrade/signal-engine" }
+    env_file: .env
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+  telegram-worker:
+    build:
+      context: .
+      args: { APP_FILTER: "@huxtrade/telegram-worker" }
+    env_file: .env
+    volumes: ["./.env:/app/.env"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+  variational-agent:
+    profiles: ["linux-agent"]
+    build:
+      context: .
+      args: { APP_FILTER: "@huxtrade/variational-agent" }
+    env_file: .env
+    volumes: ["variational_profile:/app/playwright-profile"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+volumes:
+  postgres_data:
+  variational_profile:

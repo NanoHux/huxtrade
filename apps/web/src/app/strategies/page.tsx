@@ -1,0 +1,2 @@
+import { Header } from "../../components/Header";import { StrategyManager } from "../../components/StrategyManager";import { api } from "../../lib/api";import type { Strategy } from "@huxtrade/shared-types";export const dynamic="force-dynamic";export default async function Page(){return <><Header eyebrow="Deterministic Logic" title="策略管理"/><StrategyManager initial={await api<Strategy[]>("/api/strategies",[])}/></>}
+

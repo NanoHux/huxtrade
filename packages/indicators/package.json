@@ -1,0 +1,9 @@
+{
+  "name": "@huxtrade/indicators",
+  "private": true,
+  "type": "module",
+  "exports": "./src/index.ts",
+  "dependencies": { "@huxtrade/shared-types": "workspace:*" },
+  "scripts": { "typecheck": "tsc --noEmit -p tsconfig.json" }
+}
+

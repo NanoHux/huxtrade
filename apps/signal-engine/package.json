@@ -1,0 +1,5 @@
+{
+  "name":"@huxtrade/signal-engine","private":true,"type":"module",
+  "dependencies":{"@huxtrade/config":"workspace:*","@huxtrade/database":"workspace:*","@huxtrade/exchange-clients":"workspace:*","@huxtrade/indicators":"workspace:*","@huxtrade/strategy-engine":"workspace:*"},
+  "scripts":{"dev":"tsx watch src/index.ts","build":"tsc -p tsconfig.json --outDir dist","start":"tsx src/index.ts","typecheck":"tsc --noEmit -p tsconfig.json"}
+}
