@@ -1,0 +1,20 @@
+import { getConfig } from "@huxtrade/config";
+import { CoinGlassFreeWebClient,type CoinGlassHeatmapRange } from "@huxtrade/exchange-clients";
+
+const config=getConfig();
+const collector=new CoinGlassFreeWebClient(undefined,undefined,undefined,config.COINGLASS_OBE,config.COINGLASS_BROWSER_HEADERS_B64);
+const range=(process.env.COINGLASS_SMOKE_RANGE??"24h") as CoinGlassHeatmapRange;
+const urls=process.argv.slice(2);
+if(!urls.length)throw new Error("Pass one or more CoinGlass Model 1 Pair Heatmap URLs");
+
+let failures=0;
+for(const url of urls){
+  try{
+    const result=await collector.capture(url,range);
+    console.log(JSON.stringify({ok:true,url,range,capturedAt:result.capturedAt.toISOString(),regionCount:result.regions.length,strongest:result.regions.slice(0,3).map((region)=>({price:region.price,intensity:region.intensity,rank:region.rank}))}));
+  }catch(error){
+    failures+=1;
+    console.error(JSON.stringify({ok:false,url,range,error:error instanceof Error?error.message:String(error)}));
+  }
+}
+if(failures)process.exitCode=1;

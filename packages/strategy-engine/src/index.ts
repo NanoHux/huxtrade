@@ -28,27 +28,66 @@ export function eligibleHeatmapRegions(regions: Array<Omit<HeatmapRegion, "rank"
   })).filter((region) => region.rank <= 5 || region.percentile >= 0.8);
 }
 
-export function heatmapEntryState(input:{region:HeatmapRegion;price:number;closedAt:string;armedAt?:string|null;conditionsValid:boolean}) {
+/**
+ * Spec 7.2: entering the region only arms the candidate. Confirmation requires
+ * the close of the following 15-minute candle, which is exactly the persisted
+ * `confirm_after` boundary (armed close + one scan period).
+ */
+export function heatmapEntryState(input:{region:HeatmapRegion;price:number;closedAt:string;armedAt?:string|null;confirmAfter?:string|null;conditionsValid:boolean}) {
   if (!input.conditionsValid) return { state:"INVALIDATED" as const, reason:"CONDITIONS_INVALID" };
   const inside=input.price>=input.region.lowPrice&&input.price<=input.region.highPrice;
   if (input.armedAt) {
     if(!inside)return {state:"INVALIDATED" as const,reason:"PRICE_EXITED_REGION"};
-    return new Date(input.closedAt).getTime()>new Date(input.armedAt).getTime()
+    const boundary=input.confirmAfter
+      ? new Date(input.confirmAfter).getTime()
+      : new Date(input.armedAt).getTime()+fixedRules.scanMinutes*60_000;
+    return new Date(input.closedAt).getTime()>=boundary
       ? {state:"CONFIRMED" as const,reason:"NEXT_15M_CLOSE_CONFIRMED"}
       : {state:"ARMED" as const,reason:"WAITING_NEXT_15M_CLOSE"};
   }
   return inside?{state:"ARMED" as const,reason:"PRICE_ENTERED_REGION"}:{state:"WAITING_ENTRY" as const,reason:"PRICE_OUTSIDE_REGION"};
 }
 
+/** Spec 7.3: the take-profit sits `0.15 x 1h ATR` in front of the target region. */
+export function takeProfitPriceFor(region: Pick<HeatmapRegion, "price">, direction: Direction, atr1h: number): number {
+  return direction === "LONG"
+    ? region.price - fixedRules.takeProfitAtrOffset * atr1h
+    : region.price + fixedRules.takeProfitAtrOffset * atr1h;
+}
+
+/**
+ * Spec 7.3: the first candidate is the strongest eligible region in the trade
+ * direction. When it cannot deliver a 1.5 reward/risk ratio the search
+ * continues outward — strictly *farther* regions only, nearest first — so a
+ * weaker but closer region can never replace the primary candidate.
+ */
 export function chooseHeatmapTarget(regions: HeatmapRegion[], direction: Direction, entry: number, stop: number, atr1h: number): HeatmapRegion | undefined {
   const risk = Math.abs(entry - stop);
-  const candidates = regions
-    .filter((r) => direction === "LONG" ? r.price > entry : r.price < entry)
-    .sort((a, b) => b.intensity - a.intensity);
-  return candidates.find((r) => {
-    const target = direction === "LONG" ? r.price - fixedRules.takeProfitAtrOffset * atr1h : r.price + fixedRules.takeProfitAtrOffset * atr1h;
-    return Math.abs(target - entry) / risk >= fixedRules.minimumRiskReward;
-  });
+  if (!(risk > 0)) return undefined;
+  const distance = (region: HeatmapRegion) => direction === "LONG" ? region.price - entry : entry - region.price;
+  const meetsRiskReward = (region: HeatmapRegion) => {
+    const target = takeProfitPriceFor(region, direction, atr1h);
+    const reward = direction === "LONG" ? target - entry : entry - target;
+    return reward / risk >= fixedRules.minimumRiskReward - 1e-9;
+  };
+  const ahead = regions.filter((region) => distance(region) > 0).sort((a, b) => distance(a) - distance(b));
+  if (!ahead.length) return undefined;
+  const primary = [...ahead].sort((a, b) => b.intensity - a.intensity || distance(a) - distance(b))[0]!;
+  if (meetsRiskReward(primary)) return primary;
+  return ahead.find((region) => distance(region) > distance(primary) && meetsRiskReward(region));
+}
+
+/**
+ * Spec 7.3 "反向阻挡": a significant liquidation region sitting between the
+ * entry and the fixed 1.5R objective rejects the trade. The check is anchored
+ * on the fixed 1.5R level and therefore applies to every new order, not only to
+ * the fallback take-profit path.
+ */
+export function findBlockingRegion(regions: HeatmapRegion[], direction: Direction, entry: number, risk: number): HeatmapRegion | undefined {
+  const fixedTarget = direction === "LONG" ? entry + risk * fixedRules.minimumRiskReward : entry - risk * fixedRules.minimumRiskReward;
+  return regions.find((region) => direction === "LONG"
+    ? region.price > entry && region.price < fixedTarget
+    : region.price < entry && region.price > fixedTarget);
 }
 
 export function makeOrderPlan(input: {
@@ -59,13 +98,11 @@ export function makeOrderPlan(input: {
   const stopLoss = direction === "LONG" ? input.swing - fixedRules.stopAtrBuffer * atr1h : input.swing + fixedRules.stopAtrBuffer * atr1h;
   const risk = direction === "LONG" ? entryPrice - stopLoss : stopLoss - entryPrice;
   if (risk <= 0) throw new Error("market structure produces an invalid stop");
+  const blocking = findBlockingRegion(input.regions, direction, entryPrice, risk);
+  if (blocking) throw new Error(`an opposing heatmap region at ${blocking.price} blocks the path to the 1.5R target`);
   const target = chooseHeatmapTarget(input.regions, direction, entryPrice, stopLoss, atr1h);
   const fallback = direction === "LONG" ? entryPrice + risk * fixedRules.minimumRiskReward : entryPrice - risk * fixedRules.minimumRiskReward;
-  const fallbackBlocked=!target&&input.regions.some((region)=>direction==="LONG"?region.price>entryPrice&&region.price<fallback:region.price<entryPrice&&region.price>fallback);
-  if(fallbackBlocked)throw new Error("fallback 1.5R target is blocked by an opposing heatmap region");
-  const takeProfit = target
-    ? direction === "LONG" ? target.price - fixedRules.takeProfitAtrOffset * atr1h : target.price + fixedRules.takeProfitAtrOffset * atr1h
-    : fallback;
+  const takeProfit = target ? takeProfitPriceFor(target, direction, atr1h) : fallback;
   const expectedRiskReward = Math.abs(takeProfit - entryPrice) / risk;
   if (expectedRiskReward < fixedRules.minimumRiskReward - 1e-9) throw new Error("risk/reward below 1.5");
   const key = createHash("sha256").update(`${input.symbol}|${direction}|${input.closedAt}`).digest("hex");

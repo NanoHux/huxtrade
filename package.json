@@ -8,6 +8,10 @@
     "dev": "pnpm --parallel --filter @huxtrade/api --filter @huxtrade/web dev",
     "db:migrate": "pnpm --filter @huxtrade/database migrate",
     "db:seed": "pnpm --filter @huxtrade/database seed",
+    "coinglass:agent": "pnpm --filter @huxtrade/coinglass-agent start",
+    "macos:variational:install": "node scripts/macos/variational-launchagent.mjs install",
+    "macos:variational:status": "node scripts/macos/variational-launchagent.mjs status",
+    "macos:variational:uninstall": "node scripts/macos/variational-launchagent.mjs uninstall",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "pnpm -r --if-present typecheck"

@@ -20,8 +20,8 @@ export async function transaction<T>(fn: (client: pg.PoolClient) => Promise<T>):
   }
 }
 
-export async function recordHealth(service: string, ok: boolean, error?: unknown, blocksTrading = false) {
-  const previous=(await query<{state:string}>("SELECT state FROM service_health WHERE service=$1",[service])).rows[0]?.state;
+export async function recordHealth(service: string, ok: boolean, error?: unknown, blocksTrading = false,emitRecoveryEvent=true) {
+  const previous=(await query<{state:string;error:string|null}>("SELECT state,error FROM service_health WHERE service=$1",[service])).rows[0];
   const message = error instanceof Error ? error.message : error ? String(error) : null;
   await query(
     `INSERT INTO service_health(service, state, last_success_at, consecutive_failures, error, blocks_trading, updated_at)
@@ -33,8 +33,8 @@ export async function recordHealth(service: string, ok: boolean, error?: unknown
        error=EXCLUDED.error, blocks_trading=EXCLUDED.blocks_trading, updated_at=now()`,
     [service, ok ? "healthy" : "degraded", ok, message, blocksTrading]
   );
-  if(!ok&&message)await query("INSERT INTO business_errors(service,code,message,blocks_trading) VALUES($1,'SERVICE_HEALTH_FAILURE',$2,$3)",[service,message,blocksTrading]);
-  if(ok&&previous&&previous!=="healthy")await query("INSERT INTO outbox(topic,payload) VALUES('notification.service_recovered',$1)",[JSON.stringify({service,recoveredAt:new Date().toISOString()})]);
+  if(!ok&&message&&(previous?.state!=="degraded"||previous.error!==message))await query("INSERT INTO business_errors(service,code,message,blocks_trading) VALUES($1,'SERVICE_HEALTH_FAILURE',$2,$3)",[service,message,blocksTrading]);
+  if(ok&&emitRecoveryEvent&&previous&&previous.state!=="healthy")await query("INSERT INTO outbox(topic,payload) VALUES('notification.service_recovered',$1)",[JSON.stringify({service,recoveredAt:new Date().toISOString()})]);
 }
 
 export async function recordBusinessError(input:{service:string;code:string;message:string;assetId?:string;context?:Record<string,unknown>;blocksTrading?:boolean}){

@@ -6,6 +6,11 @@ coverage/
 .env.local
 .pnpm-store/
 playwright-profile/
+coinglass-profile/
 variational-discovery/
+*.har
+*-variational-sanitized.jsonl
 .codex/
 *.log
+*.tsbuildinfo
+.DS_Store

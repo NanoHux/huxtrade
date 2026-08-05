@@ -16,4 +16,5 @@ async function tick(){
  catch(error){const attempts=Number(item.attempts)+1;if(attempts>=fixedRules.telegramMaxAttempts){await query("UPDATE outbox SET status='failed',attempts=$1 WHERE id=$2",[attempts,item.id]);await recordHealth("telegram-worker",false,error,false);}else await query("UPDATE outbox SET status='pending',attempts=$1,available_at=now()+interval '10 seconds' WHERE id=$2",[attempts,item.id]);}
 }
 process.on("SIGTERM",async()=>{await pool.end();process.exit(0);});
+await recordHealth("telegram-worker",Boolean(config.TELEGRAM_BOT_TOKEN&&config.TELEGRAM_CHAT_ID),config.TELEGRAM_BOT_TOKEN&&config.TELEGRAM_CHAT_ID?undefined:"Telegram is not configured",false);
 while(true){await tick();await sleep(2_000);}

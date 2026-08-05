@@ -25,6 +25,7 @@ services:
       context: .
       args: { APP_FILTER: "@huxtrade/api" }
     env_file: .env
+    environment: { NODE_ENV: production }
     volumes: ["./.env:/app/.env"]
     ports: ["127.0.0.1:4000:4000"]
     depends_on:
@@ -43,6 +44,7 @@ services:
         APP_FILTER: "@huxtrade/web"
         NEXT_PUBLIC_API_URL: "${NEXT_PUBLIC_API_URL:-http://localhost:4000}"
     env_file: .env
+    environment: { NODE_ENV: production }
     ports: ["127.0.0.1:3000:3000"]
     depends_on:
       api: { condition: service_healthy }
@@ -58,6 +60,20 @@ services:
       context: .
       args: { APP_FILTER: "@huxtrade/market-collector" }
     env_file: .env
+    environment: { NODE_ENV: production }
+    volumes: ["./.env:/app/.env"]
+    depends_on:
+      api: { condition: service_healthy }
+    restart: unless-stopped
+
+  coinglass-agent:
+    build:
+      context: .
+      args: { APP_FILTER: "@huxtrade/coinglass-agent" }
+    env_file: .env
+    environment: { NODE_ENV: production }
+    # The session header can be rewritten from 系统设置; the bind mount lets a
+    # restart pick up the new .env instead of the value baked in at creation.
     volumes: ["./.env:/app/.env"]
     depends_on:
       api: { condition: service_healthy }
@@ -68,6 +84,7 @@ services:
       context: .
       args: { APP_FILTER: "@huxtrade/signal-engine" }
     env_file: .env
+    environment: { NODE_ENV: production }
     depends_on:
       api: { condition: service_healthy }
     restart: unless-stopped
@@ -77,6 +94,7 @@ services:
       context: .
       args: { APP_FILTER: "@huxtrade/telegram-worker" }
     env_file: .env
+    environment: { NODE_ENV: production }
     volumes: ["./.env:/app/.env"]
     depends_on:
       api: { condition: service_healthy }
@@ -88,6 +106,7 @@ services:
       context: .
       args: { APP_FILTER: "@huxtrade/variational-agent" }
     env_file: .env
+    environment: { NODE_ENV: production }
     volumes: ["variational_profile:/app/playwright-profile"]
     depends_on:
       api: { condition: service_healthy }

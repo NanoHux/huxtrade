@@ -1,6 +1,7 @@
 import type { OrderPlan, OrderState } from "@huxtrade/shared-types";
 
 export type PlatformEntryState="PENDING_ENTRY"|"FILLED_OPEN"|"CANCELLED_EXTERNALLY"|"UNKNOWN";
+export interface SubmittedPrices{entryPrice:string;takeProfit:string;stopLoss:string;decimals:number;expectedRiskReward:number}
 export interface PlatformEntry{
   id:string;
   state:PlatformEntryState;
@@ -10,9 +11,11 @@ export interface PlatformEntry{
   openedAt?:string;
   takeProfitPresent?:boolean;
   stopLossPresent?:boolean;
+  /** Prices actually accepted by the platform after precision quantization. */
+  submittedPrices?:SubmittedPrices;
 }
 export interface PlatformProtection{id:string;raw:Record<string,unknown>}
-export type AuthoritativePlatformState="PENDING_ENTRY"|"FILLED_OPEN"|"CLOSED_TP"|"CLOSED_SL"|"LIQUIDATED"|"CANCELLED_EXTERNALLY";
+export type AuthoritativePlatformState="PENDING_ENTRY"|"FILLED_OPEN"|"CLOSED_TP"|"CLOSED_SL"|"LIQUIDATED"|"CANCELLED_EXTERNALLY"|"UNKNOWN";
 export interface PlatformPositionSnapshot{
   id:string;quantity:number;entryPrice:number;openedAt:string;takeProfit?:number;stopLoss?:number;
   unrealizedPnl?:number;realizedPnl?:number;closedAt?:string|null;raw:Record<string,unknown>;

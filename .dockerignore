@@ -4,4 +4,9 @@ dist
 .git
 .env
 .codex
-
+*.har
+*-variational-sanitized.jsonl
+variational-discovery
+playwright-profile
+coinglass-profile
+*.docx

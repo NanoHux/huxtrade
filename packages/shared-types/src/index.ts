@@ -14,6 +14,7 @@ export interface Asset {
   code: string;
   binanceSymbol: string;
   coinglassSymbol: string;
+  coinglassUrl: string;
   variationalUrl: string;
   collectEnabled: boolean;
   signalEnabled: boolean;
@@ -93,6 +94,41 @@ export interface OrderPlan {
   heatmapTarget?: HeatmapRegion;
 }
 
+/** Active order states hold a symbol/side slot per spec 6.3. */
+export const openOrderStates = [
+  "CREATED_LOCAL", "SUBMITTING", "PENDING_ENTRY", "FILLED_OPEN", "UNKNOWN", "RECONCILIATION_REQUIRED"
+] as const satisfies readonly OrderState[];
+
+export interface DashboardOrder {
+  id: string;
+  code: string;
+  direction: Direction;
+  state: OrderState;
+  entryPrice: number | null;
+  stopLoss: number | null;
+  takeProfit: number | null;
+  marginUsdc: number | null;
+  realizedPnl: number | null;
+  variationalUrl: string;
+  updatedAt: string | null;
+}
+
+export interface DashboardPosition {
+  id: string;
+  code: string;
+  direction: Direction;
+  quantity: number | null;
+  entryPrice: number | null;
+  takeProfit: number | null;
+  stopLoss: number | null;
+  unrealizedPnl: number | null;
+  realizedPnl: number | null;
+  orderState: OrderState;
+  variationalUrl: string;
+  openedAt: string | null;
+  updatedAt: string | null;
+}
+
 export interface ServiceHealth {
   service: string;
   state: HealthState;
@@ -107,12 +143,21 @@ export interface DashboardSnapshot {
   liveTradingEnabled: boolean;
   globalPaused: boolean;
   btcRegime: BtcRegime;
+  btcContext?: {
+    dailyDirection: "BULL" | "BEAR" | "MIXED";
+    fourHourConfirmation: "BULL" | "BEAR" | "MIXED";
+    adxState: "TREND" | "RANGE" | "TRANSITION";
+    adx: number | null;
+  };
   marginUsagePercent: number;
   balanceUsdc: number;
   variationalLoggedIn: boolean;
+  variationalReconciled?: boolean;
   assets: Asset[];
   services: ServiceHealth[];
   orders: Array<Record<string, unknown>>;
+  openOrders: DashboardOrder[];
+  openPositions: DashboardPosition[];
   stats: { signals: number; orders: number; fills: number; fillRate: number; winRate: number; realizedPnl: number };
 }
 

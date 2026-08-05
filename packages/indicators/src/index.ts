@@ -93,20 +93,22 @@ export function confirmedMarketStructure(candles:Candle[]):"BULL"|"BEAR"|"MIXED"
 }
 
 export function classifyBtcRegime(daily: Candle[], fourHour: Candle[], previous: BtcRegime = "TRANSITION"):
-  { regime: BtcRegime; adxState: "TREND" | "RANGE" | "TRANSITION"; adx: number } {
+  { regime: BtcRegime; dailyDirection:"BULL"|"BEAR"|"MIXED"; fourHourConfirmation:"BULL"|"BEAR"|"MIXED"; adxState: "TREND" | "RANGE" | "TRANSITION"; adx: number } {
   const dClose = daily.map((x) => x.close), hClose = fourHour.map((x) => x.close);
   const d50 = ema(dClose, 50), d200 = ema(dClose, 200), h20 = ema(hClose, 20), h50 = ema(hClose, 50);
-  if (!d200.length || !h50.length) return { regime: "TRANSITION", adxState: "TRANSITION", adx: Number.NaN };
+  if (!d200.length || !h50.length) return { regime: "TRANSITION", dailyDirection:"MIXED", fourHourConfirmation:"MIXED", adxState: "TRANSITION", adx: Number.NaN };
   const structure=confirmedMarketStructure(daily);
   const dailyBull = d50.at(-1)! > d200.at(-1)! && slope(d50) > 0 && structure==="BULL";
   const dailyBear = d50.at(-1)! < d200.at(-1)! && slope(d50) < 0 && structure==="BEAR";
   const confirmBull = h20.at(-1)! > h50.at(-1)!;
   const confirmBear = h20.at(-1)! < h50.at(-1)!;
+  const dailyDirection=dailyBull?"BULL":dailyBear?"BEAR":"MIXED";
+  const fourHourConfirmation=confirmBull?"BULL":confirmBear?"BEAR":"MIXED";
   const adxValue = adx(fourHour);
   const adxState = adxValue >= 25 ? "TREND" : adxValue <= 18 ? "RANGE" : "TRANSITION";
-  if (adxState === "RANGE") return { regime: "RANGE", adxState, adx: adxValue };
-  if (adxState === "TRANSITION") return { regime: previous, adxState, adx: adxValue };
-  return { regime: dailyBull && confirmBull ? "BULL" : dailyBear && confirmBear ? "BEAR" : "TRANSITION", adxState, adx: adxValue };
+  if (adxState === "RANGE") return { regime: "RANGE", dailyDirection, fourHourConfirmation, adxState, adx: adxValue };
+  if (adxState === "TRANSITION") return { regime: previous, dailyDirection, fourHourConfirmation, adxState, adx: adxValue };
+  return { regime: dailyBull && confirmBull ? "BULL" : dailyBear && confirmBear ? "BEAR" : "TRANSITION", dailyDirection, fourHourConfirmation, adxState, adx: adxValue };
 }
 
 export function confirmedDirection(values: number[], minimumAligned: number, lookback: number): -1 | 0 | 1 {

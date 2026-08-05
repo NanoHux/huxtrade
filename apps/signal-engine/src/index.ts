@@ -3,7 +3,8 @@ import { pool, query, recordHealth, transaction } from "@huxtrade/database";
 import { BinanceFuturesClient } from "@huxtrade/exchange-clients";
 import { atr, findAtrSwing } from "@huxtrade/indicators";
 import { candidateDirections, directionAllowed, evaluateConditions, heatmapEntryState, makeOrderPlan, riskGate } from "@huxtrade/strategy-engine";
-import type { ConditionResult, Direction, HeatmapRegion, Strategy } from "@huxtrade/shared-types";
+import type { ConditionResult, Direction, HeatmapRegion, OrderPlan, Strategy } from "@huxtrade/shared-types";
+import { timestampIso } from "./time.js";
 
 const config=getConfig();
 const binance=new BinanceFuturesClient();
@@ -27,7 +28,7 @@ async function decideHeatmap(input:{row:Record<string,unknown>;strategy:Strategy
   }
   if(!strongest&&!active)return {state:"INVALIDATED" as const,reason:"NO_ELIGIBLE_REGION",regions};
   const candidateRegion=active?{price:Number(active.region_price),lowPrice:Number(active.region_low),highPrice:Number(active.region_high),intensity:Number(active.intensity),rank:1,percentile:1}:strongest!;
-  const decision=heatmapEntryState({region:candidateRegion,price:Number(input.row.price),closedAt:new Date(String(input.row.closed_at)).toISOString(),armedAt:active?new Date(String(active.entered_at)).toISOString():null,conditionsValid:input.baseValid&&Boolean(input.row.warmup_ready)&&(!active||regionStillEligible(active))});
+  const decision=heatmapEntryState({region:candidateRegion,price:Number(input.row.price),closedAt:new Date(String(input.row.closed_at)).toISOString(),armedAt:active?new Date(String(active.entered_at)).toISOString():null,confirmAfter:active?.confirm_after?new Date(String(active.confirm_after)).toISOString():null,conditionsValid:input.baseValid&&Boolean(input.row.warmup_ready)&&(!active||regionStillEligible(active))});
   if(decision.state==="ARMED"&&!active){
     await query(`INSERT INTO heatmap_candidates(asset_id,strategy_id,direction,region_price,region_low,region_high,intensity,entered_at,confirm_after)
       VALUES($1,$2,$3,$4,$5,$6,$7,$8,$8::timestamptz+interval '15 minutes') ON CONFLICT DO NOTHING`,[input.row.asset_id,input.strategy.id,input.direction,candidateRegion.price,candidateRegion.lowPrice,candidateRegion.highPrice,candidateRegion.intensity,input.row.closed_at]);
@@ -51,8 +52,8 @@ async function run(){
       query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='signal_cursor'"),
       query<{closed_at:string}>("SELECT max(closed_at)::text closed_at FROM indicator_snapshots")
     ]);
-    const latestClosedAt=latestResult.rows[0]?.closed_at??null;
-    const cursor=cursorResult.rows[0]?.value.closedAt?String(cursorResult.rows[0]?.value.closedAt):null;
+    const latestClosedAt=timestampIso(latestResult.rows[0]?.closed_at);
+    const cursor=timestampIso(cursorResult.rows[0]?.value.closedAt);
     const advanceCursor=async(closedAt:string|null)=>{if(closedAt)await query("INSERT INTO app_state(key,value) VALUES('signal_cursor',$1) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=now()",[JSON.stringify({closedAt})]);};
     if(!initialized||!cursor){const alignedNow=new Date(Math.floor(Date.now()/(15*60_000))*(15*60_000)).toISOString();await advanceCursor(latestClosedAt??alignedNow);initialized=true;await recordHealth("signal-engine",true);return;}
     if(Boolean(global.rows[0]?.value.paused)||Boolean(risk.rows[0]?.value.autoPaused)){await advanceCursor(latestClosedAt);await recordHealth("signal-engine",true);return;}
@@ -61,7 +62,17 @@ async function run(){
       ORDER BY i.closed_at LIMIT 100`,[cursor]);
     for(const row of snapshots.rows){
       const dataFresh=Date.now()-new Date(String(row.closed_at)).getTime()<fixedRules.binanceStaleMs;
-      if(!dataFresh)await transaction(async(client)=>{await client.query("UPDATE assets SET paused=true,pause_reason='STALE_BINANCE_SNAPSHOT',updated_at=now() WHERE id=$1",[row.asset_id]);await client.query("INSERT INTO asset_signal_cursors(asset_id,closed_at) VALUES($1,$2) ON CONFLICT(asset_id) DO UPDATE SET closed_at=EXCLUDED.closed_at,updated_at=now()",[row.asset_id,row.closed_at]);});
+      // Spec 4.3: a stale snapshot pauses the asset. Evaluating it anyway would
+      // only write audit noise, so the bar is skipped after the cursor moves on.
+      if(!dataFresh){
+        await transaction(async(client)=>{
+          await client.query("UPDATE assets SET paused=true,pause_reason='STALE_BINANCE_SNAPSHOT',updated_at=now() WHERE id=$1",[row.asset_id]);
+          await client.query("INSERT INTO asset_signal_cursors(asset_id,closed_at) VALUES($1,$2) ON CONFLICT(asset_id) DO UPDATE SET closed_at=EXCLUDED.closed_at,updated_at=now()",[row.asset_id,row.closed_at]);
+          await client.query("UPDATE heatmap_candidates SET status='INVALIDATED',invalid_reason='STALE_BINANCE_SNAPSHOT' WHERE asset_id=$1 AND status IN ('ARMED','CONFIRMED')",[row.asset_id]);
+          await client.query("INSERT INTO outbox(topic,payload) VALUES('notification.system_error',$1)",[JSON.stringify({asset:row.code,reason:"STALE_BINANCE_SNAPSHOT",closedAt:row.closed_at})]);
+        });
+        continue;
+      }
       const derived:Direction=row.cvd_direction==="SHORT"?"SHORT":"LONG";
       const directions=candidateDirections({cvdSelected:strategy.conditions.includes("CVD"),cvdPassed:Boolean(row.cvd_passed),cvdDirection:row.cvd_direction==="LONG"||row.cvd_direction==="SHORT"?row.cvd_direction:null});
       let hourCandles:Awaited<ReturnType<typeof binance.klines>>|undefined;
@@ -78,24 +89,39 @@ async function run(){
         const conditions=rawConditions.map((condition)=>condition.type==="HEATMAP"?{...condition,passed:heatmap.state==="CONFIRMED",reason:heatmap.reason}:condition);
         const conditionPass=evaluateConditions(strategy,conditions);
         const concurrent=await query<{count:string}>(`SELECT count(*)::text count FROM orders WHERE asset_id=$1 AND direction=$2 AND state IN ('CREATED_LOCAL','SUBMITTING','PENDING_ENTRY','FILLED_OPEN','UNKNOWN','RECONCILIATION_REQUIRED')`,[row.asset_id,direction]);
-        const gate=riskGate({globalPaused:Boolean(global.rows[0]?.value.paused),assetPaused:Boolean(row.paused)||!dataFresh,dataFresh,sessionValid:Boolean(session.rows[0]?.value.loggedIn),liveTrading:config.LIVE_TRADING_ENABLED&&Boolean(row.trade_enabled),marginUsage:Number(risk.rows[0]?.value.marginUsagePercent??0),marginAutoPaused:Boolean(risk.rows[0]?.value.autoPaused),concurrentOrders:Number(concurrent.rows[0]?.count??0),maxOrders:strategy.maxOrdersPerSide});
+        const sessionReady=Boolean(session.rows[0]?.value.loggedIn)&&Boolean(session.rows[0]?.value.reconciled);
+        const gate=riskGate({globalPaused:Boolean(global.rows[0]?.value.paused),assetPaused:Boolean(row.paused)||!dataFresh,dataFresh,sessionValid:sessionReady,liveTrading:config.LIVE_TRADING_ENABLED&&Boolean(row.trade_enabled),marginUsage:Number(risk.rows[0]?.value.marginUsagePercent??0),marginAutoPaused:Boolean(risk.rows[0]?.value.autoPaused),concurrentOrders:Number(concurrent.rows[0]?.count??0),maxOrders:strategy.maxOrdersPerSide});
         const accepted=conditionPass&&btcPass&&Boolean(row.warmup_ready);
-        const rejectionReasons=[...(!row.warmup_ready?["INDICATOR_WARMUP"]:[]),...(!conditionPass?[`HEATMAP_${heatmap.state}`]:[]),...(!btcPass?["BTC_DIRECTION_FILTER"]:[]),...gate.reasons];
+        const conditionRejections=conditions
+          .filter((condition)=>strategy.conditions.includes(condition.type)&&!condition.passed)
+          .map((condition)=>condition.type==="HEATMAP"?`HEATMAP_${heatmap.state}`:`CONDITION_${condition.type}_FAILED`);
+        let plan:OrderPlan|undefined;
+        const planRejections:string[]=[];
+        if(accepted&&gate.passed){
+          try{
+            const [candles,entryPrice]=await Promise.all([
+              hourCandles?Promise.resolve(hourCandles):binance.klines(String(row.binance_symbol),"1h",100),
+              binance.latestPrice(String(row.binance_symbol))
+            ]);
+            hourCandles=candles;
+            const atrValue=atr(candles,14).at(-1)!;
+            plan=makeOrderPlan({symbol:String(row.binance_symbol),direction,closedAt:new Date(String(row.closed_at)).toISOString(),entryPrice,swing:findAtrSwing(candles,atrValue,direction),atr1h:atrValue,regions:heatmap.regions,marginUsdc:config.DEFAULT_MARGIN_USDC,leverage:config.LEVERAGE});
+          }catch(error){planRejections.push(`ORDER_PLAN_FAILED: ${error instanceof Error?error.message:String(error)}`);}
+        }
+        const executable=accepted&&gate.passed&&Boolean(plan);
+        const rejectionReasons=[...(!row.warmup_ready?["INDICATOR_WARMUP"]:[]),...conditionRejections,...(!btcPass?["BTC_DIRECTION_FILTER"]:[]),...gate.reasons,...planRejections];
         await transaction(async(client)=>{
-          const signal=await client.query(`INSERT INTO signals(asset_id,strategy_id,closed_at,direction,executable,accepted,conditions,rejection_reasons) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING id`,[row.asset_id,strategy.id,row.closed_at,direction,accepted&&gate.passed,accepted,JSON.stringify(conditions),rejectionReasons]);
+          const signal=await client.query(`INSERT INTO signals(asset_id,strategy_id,closed_at,direction,executable,accepted,conditions,rejection_reasons) VALUES($1,$2,$3,$4,$5,$6,$7,$8) ON CONFLICT DO NOTHING RETURNING id`,[row.asset_id,strategy.id,row.closed_at,direction,executable,accepted,JSON.stringify(conditions),rejectionReasons]);
           if(!signal.rows[0])return;
-          if(accepted)await client.query("INSERT INTO outbox(topic,payload) VALUES('notification.signal',$1)",[JSON.stringify({symbol:row.code,direction,accepted,executable:accepted&&gate.passed,rejectionReasons})]);
-          if(!(accepted&&gate.passed))return;
-          hourCandles??=await binance.klines(String(row.binance_symbol),"1h",100);
-          const atrValue=atr(hourCandles,14).at(-1)!;
-          const plan=makeOrderPlan({symbol:String(row.binance_symbol),direction,closedAt:new Date(String(row.closed_at)).toISOString(),entryPrice:Number(row.price),swing:findAtrSwing(hourCandles,atrValue,direction),atr1h:atrValue,regions:heatmap.regions,marginUsdc:config.DEFAULT_MARGIN_USDC,leverage:config.LEVERAGE});
+          if(accepted)await client.query("INSERT INTO outbox(topic,payload) VALUES('notification.signal',$1)",[JSON.stringify({symbol:row.code,direction,accepted,executable,rejectionReasons})]);
+          if(!plan||!executable)return;
           const order=await client.query(`INSERT INTO orders(signal_id,asset_id,strategy_id,idempotency_key,direction,state,entry_price,stop_loss,take_profit,margin_usdc,leverage) VALUES($1,$2,$3,$4,$5,'CREATED_LOCAL',$6,$7,$8,$9,$10) ON CONFLICT(idempotency_key) DO NOTHING RETURNING id`,[signal.rows[0].id,row.asset_id,strategy.id,plan.idempotencyKey,direction,plan.entryPrice,plan.stopLoss,plan.takeProfit,plan.marginUsdc,plan.leverage]);
           if(order.rows[0]){await client.query("INSERT INTO order_events(order_id,from_state,to_state,reason,payload) VALUES($1,NULL,'CREATED_LOCAL','signal accepted',$2)",[order.rows[0].id,JSON.stringify(plan)]);await client.query("INSERT INTO outbox(topic,payload) VALUES('order.submit',$1)",[JSON.stringify({orderId:order.rows[0].id,plan})]);}
         });
       }
       await query("INSERT INTO asset_signal_cursors(asset_id,closed_at) VALUES($1,$2) ON CONFLICT(asset_id) DO UPDATE SET closed_at=EXCLUDED.closed_at,updated_at=now()",[row.asset_id,row.closed_at]);
     }
-    if(snapshots.rows.length)await advanceCursor(String(snapshots.rows.at(-1)!.closed_at));
+    if(snapshots.rows.length)await advanceCursor(timestampIso(snapshots.rows.at(-1)!.closed_at));
     await recordHealth("signal-engine",true);
   }catch(error){await recordHealth("signal-engine",false,error,true);}
 }

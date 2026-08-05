@@ -1,10 +1,10 @@
 FROM node:22-alpine AS base
 RUN corepack enable
 WORKDIR /app
-COPY package.json pnpm-workspace.yaml tsconfig.base.json ./
+COPY package.json pnpm-lock.yaml pnpm-workspace.yaml tsconfig.base.json ./
 COPY apps ./apps
 COPY packages ./packages
-RUN pnpm install --frozen-lockfile=false
+RUN pnpm install --frozen-lockfile
 
 FROM base AS build
 ARG NEXT_PUBLIC_API_URL=http://localhost:4000

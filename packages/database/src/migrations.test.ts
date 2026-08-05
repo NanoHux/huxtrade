@@ -28,14 +28,16 @@ describe("PostgreSQL migrations",()=>{
         WHERE table_schema='public' ORDER BY table_name`);
       expect(tables.rows.map((row)=>row.table_name)).toEqual(expect.arrayContaining([
         "assets","strategies","indicator_snapshots","metric_baselines","scan_runs",
-        "heatmap_candidates","signals","orders","order_events","positions","fills",
+        "heatmap_candidates","coinglass_heatmaps","signals","orders","order_events","positions","fills",
         "notification_preferences","service_health","business_errors","app_state","outbox"
       ]));
 
       const state=await db.query<{key:string}>("SELECT key FROM app_state ORDER BY key");
       expect(state.rows.map((row)=>row.key)).toEqual(expect.arrayContaining([
-        "account_risk","global_pause","signal_cursor","variational_session"
+        "account_risk","coinglass_session","global_pause","signal_cursor","variational_session"
       ]));
+      const session=await db.query<{reconciled:boolean}>("SELECT (value->>'reconciled')::boolean reconciled FROM app_state WHERE key='variational_session'");
+      expect(session.rows[0]?.reconciled).toBe(false);
       const preferences=await db.query<{count:number}>("SELECT count(*)::int count FROM notification_preferences");
       expect(preferences.rows[0]?.count).toBe(10);
 
@@ -44,8 +46,8 @@ describe("PostgreSQL migrations",()=>{
       await expect(db.query(`INSERT INTO strategies(name,enabled,logic,required_count,conditions)
         VALUES('second',true,'AND',4,ARRAY['OI','CVD','FUNDING','HEATMAP'])`)).rejects.toThrow();
 
-      const asset=await db.query<{id:string}>(`INSERT INTO assets(code,binance_symbol,coinglass_symbol,variational_url)
-        VALUES('BTC','BTCUSDT','BTCUSDT','https://trade.variational.io/markets/btc') RETURNING id`);
+      const asset=await db.query<{id:string}>(`INSERT INTO assets(code,binance_symbol,coinglass_symbol,coinglass_url,variational_url)
+        VALUES('BTC','BTCUSDT','Binance_BTCUSDT','https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC&type=pair','https://trade.variational.io/markets/btc') RETURNING id`);
       const assetId=asset.rows[0]!.id;
       await db.query("INSERT INTO metric_baselines(asset_id,metric,observed_at,value,source) VALUES($1,'OI_RAW',now(),1,'TEST')",[assetId]);
       await expect(db.query("INSERT INTO metric_baselines(asset_id,metric,observed_at,value,source) VALUES($1,'INVALID',now(),1,'TEST')",[assetId])).rejects.toThrow();
@@ -54,8 +56,8 @@ describe("PostgreSQL migrations",()=>{
       expect(baselines.rows[0]?.count).toBe(0);
 
       const strategy=await db.query<{id:string}>("SELECT id FROM strategies WHERE name='primary'");
-      const eth=await db.query<{id:string}>(`INSERT INTO assets(code,binance_symbol,coinglass_symbol,variational_url)
-        VALUES('ETH','ETHUSDT','ETHUSDT','https://trade.variational.io/markets/eth') RETURNING id`);
+      const eth=await db.query<{id:string}>(`INSERT INTO assets(code,binance_symbol,coinglass_symbol,coinglass_url,variational_url)
+        VALUES('ETH','ETHUSDT','Binance_ETHUSDT','https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=ETH&type=pair','https://trade.variational.io/markets/eth') RETURNING id`);
       const signal=await db.query<{id:string}>(`INSERT INTO signals(asset_id,strategy_id,closed_at,direction,executable,accepted,conditions)
         VALUES($1,$2,'2026-08-04T00:15:00Z','LONG',true,true,'[]') RETURNING id`,[eth.rows[0]!.id,strategy.rows[0]!.id]);
       await expect(db.query(`INSERT INTO signals(asset_id,strategy_id,closed_at,direction,executable,accepted,conditions)

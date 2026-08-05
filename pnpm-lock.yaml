@@ -54,6 +54,18 @@ importers:
         specifier: ^3.25.0
         version: 3.25.76
 
+  apps/coinglass-agent:
+    dependencies:
+      '@huxtrade/config':
+        specifier: workspace:*
+        version: link:../../packages/config
+      '@huxtrade/database':
+        specifier: workspace:*
+        version: link:../../packages/database
+      '@huxtrade/exchange-clients':
+        specifier: workspace:*
+        version: link:../../packages/exchange-clients
+
   apps/market-collector:
     dependencies:
       '@huxtrade/config':
@@ -68,6 +80,9 @@ importers:
       '@huxtrade/indicators':
         specifier: workspace:*
         version: link:../../packages/indicators
+      '@huxtrade/shared-types':
+        specifier: workspace:*
+        version: link:../../packages/shared-types
 
   apps/signal-engine:
     dependencies:

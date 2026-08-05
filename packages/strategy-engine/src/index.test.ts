@@ -1,5 +1,7 @@
 import { describe, expect, it } from "vitest";
-import { adjustMarginForPlatformMinimum, assertOrderTransition, candidateDirections, directionAllowed, eligibleHeatmapRegions, heatmapEntryState, makeOrderPlan, marginPauseTransition, riskGate } from "./index.js";
+import { adjustMarginForPlatformMinimum, assertOrderTransition, candidateDirections, chooseHeatmapTarget, directionAllowed, eligibleHeatmapRegions, findBlockingRegion, heatmapEntryState, makeOrderPlan, marginPauseTransition, riskGate } from "./index.js";
+
+const region=(price:number,intensity:number)=>({price,lowPrice:price-1,highPrice:price+1,intensity,rank:1,percentile:1});
 
 describe("strategy and risk rules", () => {
   it("enforces BTC direction permission", () => {
@@ -25,9 +27,30 @@ describe("strategy and risk rules", () => {
     expect(heatmapEntryState({region,price:100,closedAt:"2026-08-04T00:15:00Z",armedAt:"2026-08-04T00:00:00Z",conditionsValid:true}).state).toBe("CONFIRMED");
     expect(heatmapEntryState({region,price:102,closedAt:"2026-08-04T00:15:00Z",armedAt:"2026-08-04T00:00:00Z",conditionsValid:true}).state).toBe("INVALIDATED");
   });
+  it("honours the persisted confirm_after boundary",()=>{
+    const region={price:100,lowPrice:99,highPrice:101,intensity:10,rank:1,percentile:1};
+    const armed={region,price:100,armedAt:"2026-08-04T00:00:00Z",confirmAfter:"2026-08-04T00:15:00Z",conditionsValid:true};
+    expect(heatmapEntryState({...armed,closedAt:"2026-08-04T00:14:00Z"}).state).toBe("ARMED");
+    expect(heatmapEntryState({...armed,closedAt:"2026-08-04T00:15:00Z"}).state).toBe("CONFIRMED");
+  });
   it("rejects a fixed 1.5R fallback when a heatmap region blocks the path",()=>{
-    const region={price:110,lowPrice:109,highPrice:111,intensity:10,rank:1,percentile:1};
-    expect(()=>makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:2,regions:[region],marginUsdc:10,leverage:5})).toThrow(/blocked/);
+    expect(()=>makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:2,regions:[region(110,10)],marginUsdc:10,leverage:5})).toThrow(/blocks the path/);
+  });
+  it("applies the opposing-region check even when a valid heatmap target exists",()=>{
+    // Spec 7.3 anchors the check on the fixed 1.5R level, not on the chosen TP.
+    const regions=[region(108,1),region(130,100)];
+    expect(findBlockingRegion(regions,"LONG",100,10)?.price).toBe(108);
+    expect(()=>makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:0,regions,marginUsdc:10,leverage:5})).toThrow(/blocks the path/);
+    expect(findBlockingRegion([region(130,100)],"LONG",100,10)).toBeUndefined();
+    expect(findBlockingRegion([region(92,5)],"SHORT",100,10)?.price).toBe(92);
+  });
+  it("searches farther — never nearer — when the strongest region misses 1.5R",()=>{
+    const nearerButStronger=region(105,50),primary=region(110,100),tooClose=region(112,1),valid=region(120,5);
+    const chosen=chooseHeatmapTarget([nearerButStronger,primary,tooClose,valid],"LONG",100,90,0);
+    expect(chosen?.price).toBe(120);
+    // The strongest region is used directly whenever it already clears 1.5R.
+    expect(chooseHeatmapTarget([region(130,100),region(140,1)],"LONG",100,90,0)?.price).toBe(130);
+    expect(chooseHeatmapTarget([region(105,100)],"LONG",100,90,0)).toBeUndefined();
   });
   it("fails closed on risk gates and invalid state transitions", () => {
     expect(riskGate({ globalPaused:false, assetPaused:false, dataFresh:true, sessionValid:false, liveTrading:true, marginUsage:20, concurrentOrders:0, maxOrders:5 }).passed).toBe(false);

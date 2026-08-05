@@ -3,17 +3,12 @@ import { pool,query,recordBusinessError,recordHealth,transaction } from "@huxtra
 import { adjustMarginForPlatformMinimum,assertOrderTransition,marginPauseTransition } from "@huxtrade/strategy-engine";
 import type { OrderPlan } from "@huxtrade/shared-types";
 import { notificationTopicsForTransition,reconcileProtectionState,submitWithInitialProtection,type PlatformEntry,type PlatformEntryState,type PlatformProtection,type PlatformTrackedOrder,type ProtectionAdapter } from "./execution.js";
+import { BrowserFetchTransport } from "./browser-fetch-transport.js";
+import { OmniBrowserAdapter,type VariationalAdapter } from "./omni-adapter.js";
 
 const config=getConfig();
 const sleep=(ms:number)=>new Promise((resolve)=>setTimeout(resolve,ms));
-interface Adapter extends ProtectionAdapter{
-  sessionValid():Promise<boolean>;
-  account():Promise<{balanceUsdc:number;marginUsagePercent:number}>;
-  minimumMargin(plan:OrderPlan):Promise<number>;
-  listTracked(orderIds:string[]):Promise<PlatformTrackedOrder[]>;
-  cancelPending():Promise<Array<{id:string;cancelled:boolean}>>;
-}
-class DisabledAdapter implements Adapter{
+class DisabledAdapter implements VariationalAdapter{
   async sessionValid(){return false;}
   async account():Promise<{balanceUsdc:number;marginUsagePercent:number}>{throw new Error("Variational adapter is disabled");}
   async minimumMargin(_plan:OrderPlan):Promise<number>{throw new Error("Variational adapter is disabled");}
@@ -28,8 +23,9 @@ class DisabledAdapter implements Adapter{
   async cancelPending():Promise<Array<{id:string;cancelled:boolean}>>{throw new Error("Variational adapter is disabled");}
 }
 
-// Stage-0 protocol discovery replaces this fail-closed adapter with verified calls.
-const adapter:Adapter=new DisabledAdapter();
+const adapter:VariationalAdapter=config.VARIATIONAL_ADAPTER_MODE==="browser-fetch"
+  ?new OmniBrowserAdapter(new BrowserFetchTransport(config),config)
+  :new DisabledAdapter();
 
 async function setState(orderId:string,from:string,to:string,reason:string,payload?:unknown){
   assertOrderTransition(from,to);
@@ -72,10 +68,13 @@ async function persistPlatformDetails(order:{id:string;asset_id:string},remote:P
       positionId=saved.rows[0]?.id??null;
       if(position.realizedPnl!==undefined)await client.query("UPDATE orders SET realized_pnl=$1,updated_at=now() WHERE id=$2",[position.realizedPnl,order.id]);
     }
-    for(const fill of remote.fills??[])await client.query(`INSERT INTO fills(order_id,position_id,platform_fill_id,side,price,quantity,fee,realized_pnl,filled_at,raw_platform_state)
-      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(platform_fill_id) DO UPDATE SET position_id=EXCLUDED.position_id,fee=EXCLUDED.fee,realized_pnl=EXCLUDED.realized_pnl,raw_platform_state=EXCLUDED.raw_platform_state`,[
-      order.id,positionId,fill.id,fill.side,fill.price,fill.quantity,fill.fee??null,fill.realizedPnl??null,fill.filledAt,JSON.stringify(fill.raw)
-    ]);
+    for(const fill of remote.fills??[]){
+      await client.query(`INSERT INTO fills(order_id,position_id,platform_fill_id,side,price,quantity,fee,realized_pnl,filled_at,raw_platform_state)
+        VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9,$10) ON CONFLICT(platform_fill_id) DO UPDATE SET position_id=EXCLUDED.position_id,fee=EXCLUDED.fee,realized_pnl=EXCLUDED.realized_pnl,raw_platform_state=EXCLUDED.raw_platform_state`,[
+        order.id,positionId,fill.id,fill.side,fill.price,fill.quantity,fill.fee??null,fill.realizedPnl??null,fill.filledAt,JSON.stringify(fill.raw)
+      ]);
+      if(fill.realizedPnl!==undefined)await client.query("UPDATE orders SET realized_pnl=$1,updated_at=now() WHERE id=$2",[fill.realizedPnl,order.id]);
+    }
   });
 }
 
@@ -120,14 +119,41 @@ async function claimWork(){
   });
 }
 
+async function cancelManagedPending(newStrategyId?:string){
+  const result=await query<{id:string;asset_id:string;platform_order_id:string|null;state:string;strategy_id:string}>(`SELECT id,asset_id,platform_order_id,state,strategy_id
+    FROM orders WHERE state='PENDING_ENTRY' ${newStrategyId?"AND strategy_id<>$1":""} ORDER BY created_at`,newStrategyId?[newStrategyId]:[]);
+  const cancellations:Array<{orderId:string;platformOrderId:string|null;cancelled:boolean;state?:PlatformEntryState;error?:string}>=[];
+  for(const order of result.rows){
+    if(!order.platform_order_id){
+      const error="Local pending order has no platform order ID";
+      cancellations.push({orderId:order.id,platformOrderId:null,cancelled:false,error});
+      await recordBusinessError({service:"variational-agent",assetId:order.asset_id,code:"MANAGED_ORDER_CANCEL_FAILED",message:error,blocksTrading:false,context:{orderId:order.id}});
+      continue;
+    }
+    try{
+      const cancelled=await adapter.cancelEntry(order.platform_order_id);
+      cancellations.push({orderId:order.id,platformOrderId:order.platform_order_id,cancelled:cancelled.cancelled,state:cancelled.state});
+      if(cancelled.state!==order.state)await setState(order.id,order.state,cancelled.state,"operator control cancellation reconciliation",cancelled.raw);
+      if(!cancelled.cancelled&&cancelled.state==="PENDING_ENTRY")await recordBusinessError({service:"variational-agent",assetId:order.asset_id,code:"MANAGED_ORDER_CANCEL_NOT_CONFIRMED",message:"Variational still reports the entry as pending after one cancellation attempt",blocksTrading:false,context:{orderId:order.id,platformOrderId:order.platform_order_id}});
+    }catch(error){
+      const message=error instanceof Error?error.message:String(error);
+      cancellations.push({orderId:order.id,platformOrderId:order.platform_order_id,cancelled:false,error:message});
+      await recordBusinessError({service:"variational-agent",assetId:order.asset_id,code:"MANAGED_ORDER_CANCEL_FAILED",message,blocksTrading:false,context:{orderId:order.id,platformOrderId:order.platform_order_id}});
+    }
+  }
+  return cancellations;
+}
+
 async function handleControl(item:Record<string,unknown>){
   if(item.topic==="control.global_resume"){await query("UPDATE outbox SET status='sent',sent_at=now() WHERE id=$1",[item.id]);return;}
-  try{
-    const result=await adapter.cancelPending();
-    await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({cancellationResult:result}),item.id]);
-  }catch(error){
-    await query("UPDATE outbox SET status='failed',attempts=attempts+1,payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({error:error instanceof Error?error.message:String(error)}),item.id]);
+  if(item.topic==="control.global_pause"){
+    const state=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='global_pause'")).rows[0]?.value;
+    if(!state?.paused){await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||'{\"skipped\":\"GLOBAL_PAUSE_NO_LONGER_ACTIVE\"}'::jsonb WHERE id=$1",[item.id]);return;}
   }
+  const payload=item.payload as {strategyId?:unknown};
+  const newStrategyId=item.topic==="strategy.changed"&&typeof payload.strategyId==="string"?payload.strategyId:undefined;
+  const result=await cancelManagedPending(newStrategyId);
+  await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({cancellationResult:result}),item.id]);
 }
 
 async function handleOrder(item:Record<string,unknown>){
@@ -148,7 +174,12 @@ async function handleOrder(item:Record<string,unknown>){
     await query("UPDATE orders SET margin_usdc=$1 WHERE id=$2",[adjusted.marginUsdc,payload.orderId]);
     submissionAttempted=true;
     const result=await submitWithInitialProtection(adapter,plan);
-    await query("UPDATE orders SET platform_order_id=$1 WHERE id=$2",[result.entry.id,payload.orderId]);
+    const submitted=result.entry.submittedPrices;
+    // The platform's price precision is authoritative; store what was actually
+    // submitted so the audit trail and the Dashboard never show a price that
+    // Variational never saw.
+    if(submitted)await query("UPDATE orders SET platform_order_id=$1,entry_price=$2,take_profit=$3,stop_loss=$4,updated_at=now() WHERE id=$5",[result.entry.id,submitted.entryPrice,submitted.takeProfit,submitted.stopLoss,payload.orderId]);
+    else await query("UPDATE orders SET platform_order_id=$1 WHERE id=$2",[result.entry.id,payload.orderId]);
     if(result.status==="PROTECTED"){
       await setState(payload.orderId,"SUBMITTING",result.entry.state,"entry and both protections confirmed",result);
       await query("UPDATE outbox SET status='sent',sent_at=now() WHERE id=$1",[item.id]);
@@ -177,16 +208,17 @@ async function rejectWithoutSubmission(item:Record<string,unknown>,reason:string
 async function tick(){
   const previousSession=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='variational_session'")).rows[0]?.value??{};
   const valid=await adapter.sessionValid();
-  const discoveryComplete=["http","browser-fetch","ui"].includes(config.VARIATIONAL_ADAPTER_MODE);
-  await query("UPDATE app_state SET value=$1,updated_at=now() WHERE key='variational_session'",[JSON.stringify({loggedIn:valid,discoveryComplete})]);
+  const discoveryComplete=config.VARIATIONAL_ADAPTER_MODE==="browser-fetch";
   if(previousSession.loggedIn&&!valid)await query("INSERT INTO outbox(topic,payload) VALUES('notification.variational_session_lost',$1)",[JSON.stringify({detectedAt:new Date().toISOString()})]);
   const accountError=valid?await refreshAccount():undefined;
   const reconciliationError=valid?await reconcileOpenOrders():undefined;
+  const reconciled=valid&&(Boolean(previousSession.reconciled)||!reconciliationError);
+  await query("UPDATE app_state SET value=$1,updated_at=now() WHERE key='variational_session'",[JSON.stringify({loggedIn:valid,discoveryComplete,reconciled})]);
   const item=await claimWork();
   if(item){
     if(item.topic==="order.submit"){
-      if(valid&&config.LIVE_TRADING_ENABLED)await handleOrder(item);
-      else await rejectWithoutSubmission(item,!valid?"VARIATIONAL_SESSION_INVALID":"LIVE_TRADING_DISABLED");
+      if(valid&&reconciled&&config.LIVE_TRADING_ENABLED)await handleOrder(item);
+      else await rejectWithoutSubmission(item,!valid?"VARIATIONAL_SESSION_INVALID":!reconciled?"STARTUP_RECONCILIATION_INCOMPLETE":"LIVE_TRADING_DISABLED");
     }else await handleControl(item);
   }
   if(!valid||!config.LIVE_TRADING_ENABLED){await recordHealth("variational-agent",false,!valid?"Variational session invalid":"Live trading disabled",true);return;}
@@ -194,5 +226,23 @@ async function tick(){
   await recordHealth("variational-agent",!readError,readError,false);
 }
 
-process.on("SIGTERM",async()=>{await pool.end();process.exit(0);});
+async function recoverInterruptedWork(){
+  await transaction(async(client)=>{
+    const interrupted=await client.query<{id:string}>("SELECT id FROM orders WHERE state='SUBMITTING' FOR UPDATE");
+    for(const order of interrupted.rows){
+      await client.query("UPDATE orders SET state='UNKNOWN',updated_at=now() WHERE id=$1",[order.id]);
+      await client.query("INSERT INTO order_events(order_id,from_state,to_state,reason,payload) VALUES($1,'SUBMITTING','UNKNOWN','agent restarted during an ambiguous submission',NULL)",[order.id]);
+      await client.query("INSERT INTO outbox(topic,payload) VALUES('notification.order_failed',$1)",[JSON.stringify({orderId:order.id,reason:"AMBIGUOUS_SUBMISSION_AFTER_RESTART",manualIntervention:true})]);
+    }
+    await client.query("UPDATE outbox SET status='failed',attempts=attempts+1 WHERE topic='order.submit' AND status='processing'");
+    await client.query("UPDATE outbox SET status='pending' WHERE topic<>'order.submit' AND status='processing'");
+  });
+}
+
+let shuttingDown=false;
+async function shutdown(){if(shuttingDown)return;shuttingDown=true;await adapter.close?.();await pool.end();process.exit(0);}
+process.on("SIGTERM",shutdown);
+process.on("SIGINT",shutdown);
+await query("UPDATE app_state SET value=value||'{\"loggedIn\":false,\"reconciled\":false}'::jsonb,updated_at=now() WHERE key='variational_session'");
+await recoverInterruptedWork();
 while(true){try{await tick();}catch(error){await recordHealth("variational-agent",false,error,true);}await sleep(fixedRules.variationalPollMs);}

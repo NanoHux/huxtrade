@@ -1,9 +1,12 @@
+import { randomUUID } from "node:crypto";
 import { claimRestartRequest, pool, query, recordBusinessError, recordHealth } from "@huxtrade/database";
-import { BinanceFuturesClient, CoinGlassClient } from "@huxtrade/exchange-clients";
+import { BinanceFuturesClient } from "@huxtrade/exchange-clients";
+import { fixedRules } from "@huxtrade/config";
 import { classifyBtcRegime, cvdAnomaly, fundingAnomaly, oiAnomaly } from "@huxtrade/indicators";
+import type { HeatmapRegion } from "@huxtrade/shared-types";
+import { scanningPaused } from "./control.js";
 
 const binance = new BinanceFuturesClient();
-const coinglass = new CoinGlassClient();
 const sleep = (ms:number) => new Promise((resolve) => setTimeout(resolve, ms));
 const quarterMs = 15 * 60_000;
 const baselineSamples = 30 * 24 * 4;
@@ -63,14 +66,34 @@ async function metricValues(assetId:string,metric:BaselineMetric,currentAt:Date,
   return rows.rows.reverse().map((row)=>Number(row.value));
 }
 
-async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closedAt:Date,scanRunId:string,heatmapRange:string):Promise<boolean>{
+async function requestHeatmapRefresh(closedAt:Date,heatmapRange:string){
+  const requestId=randomUUID(),requestedAt=new Date();
+  await query(`INSERT INTO app_state(key,value) VALUES('coinglass_refresh_request',$1)
+    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,[JSON.stringify({requestId,requestedAt:requestedAt.toISOString(),closedAt:closedAt.toISOString(),heatmapRange})]);
+  const deadline=Date.now()+45_000;
+  while(Date.now()<deadline){
+    const result=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='coinglass_refresh_result'")).rows[0]?.value;
+    if(result?.requestId===requestId)return requestedAt;
+    if(await claimRestartRequest("market-collector")){await pool.end();process.exit(0);}
+    await sleep(1_000);
+  }
+  return requestedAt;
+}
+
+async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closedAt:Date,scanRunId:string,heatmapRange:string,heatmapNotBefore:Date):Promise<boolean>{
   const id=String(asset.id),symbol=String(asset.binance_symbol);
   try{
     await prewarmAsset(asset);
-    const [price,oi,funding,trades,heatmap]=await Promise.all([
+    const [price,oi,funding,trades,heatmapResult]=await Promise.all([
       binance.latestPrice(symbol),binance.openInterest(symbol),binance.fundingHistory(symbol,8),
-      binance.aggregateTrades(symbol,closedAt.getTime()-quarterMs,closedAt.getTime()-1),coinglass.heatmap(String(asset.coinglass_symbol),heatmapRange)
+      binance.aggregateTrades(symbol,closedAt.getTime()-quarterMs,closedAt.getTime()-1),
+      query<{regions:HeatmapRegion[];captured_at:Date}>("SELECT regions,captured_at FROM coinglass_heatmaps WHERE asset_id=$1 AND heatmap_range=$2",[id,heatmapRange])
     ]);
+    const heatmapRow=heatmapResult.rows[0];
+    const heatmapCapturedAt=heatmapRow?new Date(heatmapRow.captured_at).getTime():NaN;
+    if(!heatmapRow||Date.now()-heatmapCapturedAt>fixedRules.heatmapStaleMs||heatmapCapturedAt<heatmapNotBefore.getTime())throw new Error(`CoinGlass ${heatmapRange} Heatmap was not refreshed for this scan`);
+    const heatmap={regions:Array.isArray(heatmapRow.regions)?heatmapRow.regions:[]};
+    if(!heatmap.regions.length)throw new Error(`CoinGlass ${heatmapRange} Heatmap cache contains no eligible regions`);
     const cvdBins=trades.reduce<number[]>((bins,trade)=>{
       const index=Math.min(2,Math.max(0,Math.floor((trade.T-(closedAt.getTime()-quarterMs))/(5*60_000))));
       bins[index]=(bins[index]??0)+(trade.m?-1:1)*Number(trade.p)*Number(trade.q);return bins;
@@ -91,7 +114,7 @@ async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closed
       ON CONFLICT(asset_id,closed_at) DO UPDATE SET scan_run_id=EXCLUDED.scan_run_id,price=EXCLUDED.price,oi_value=EXCLUDED.oi_value,oi_change_1h=EXCLUDED.oi_change_1h,oi_z=EXCLUDED.oi_z,oi_passed=EXCLUDED.oi_passed,cvd_value=EXCLUDED.cvd_value,cvd_z=EXCLUDED.cvd_z,cvd_passed=EXCLUDED.cvd_passed,cvd_direction=EXCLUDED.cvd_direction,funding_value=EXCLUDED.funding_value,funding_change_4h=EXCLUDED.funding_change_4h,funding_z=EXCLUDED.funding_z,funding_change_z=EXCLUDED.funding_change_z,funding_passed=EXCLUDED.funding_passed,heatmap=EXCLUDED.heatmap,heatmap_passed=EXCLUDED.heatmap_passed,btc_regime=EXCLUDED.btc_regime,warmup_ready=EXCLUDED.warmup_ready,inputs=EXCLUDED.inputs`,[
       id,scanRunId,closedAt,price,oi.value,oiResult.value,oiResult.zScore,oiResult.passed,cvd,cvdResult.zScore,cvdResult.passed,cvdResult.direction>0?"LONG":cvdResult.direction<0?"SHORT":null,
       fundingResult.value,fundingResult.change4h,fundingResult.currentZ,fundingResult.changeZ,fundingResult.passed,JSON.stringify(heatmap.regions),heatmap.regions.length>0,btcRegime,warmupReady,
-      JSON.stringify({oiTime:oi.time,tradeCount:trades.length,baselineSamples:{oi:oiResult.sampleCount,cvd:cvdResult.sampleCount,funding:fundingResult.sampleCount},fundingScore:fundingResult.score,heatmapRange})
+      JSON.stringify({oiTime:oi.time,tradeCount:trades.length,baselineSamples:{oi:oiResult.sampleCount,cvd:cvdResult.sampleCount,funding:fundingResult.sampleCount},fundingScore:fundingResult.score,heatmapRange,heatmapCapturedAt:new Date(heatmapRow.captured_at).toISOString()})
     ]);
     await query("UPDATE assets SET last_updated_at=now(),updated_at=now() WHERE id=$1",[id]);
     return true;
@@ -107,8 +130,16 @@ async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closed
 async function scan(){
   const closedAt=new Date(Math.floor(Date.now()/quarterMs)*quarterMs);
   let scanRunId:string|undefined;
+  let binanceHealthy=false;
   try{
-    const [daily,fourHour,assets,strategy]=await Promise.all([binance.klines("BTCUSDT","1d",260),binance.klines("BTCUSDT","4h",300),query("SELECT * FROM assets WHERE collect_enabled=true AND paused=false ORDER BY code"),query<{heatmap_range:string}>("SELECT heatmap_range FROM strategies WHERE enabled=true LIMIT 1")]);
+    const [globalState,riskState]=await Promise.all([
+      query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='global_pause'"),
+      query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='account_risk'")
+    ]);
+    if(scanningPaused(globalState.rows[0]?.value,riskState.rows[0]?.value)){await recordHealth("market-collector",true);return;}
+    const [daily,fourHour]=await Promise.all([binance.klines("BTCUSDT","1d",260),binance.klines("BTCUSDT","4h",300)]);
+    await recordHealth("binance",true);binanceHealthy=true;
+    const [assets,strategy]=await Promise.all([query("SELECT * FROM assets WHERE collect_enabled=true AND paused=false ORDER BY code"),query<{heatmap_range:string}>("SELECT heatmap_range FROM strategies WHERE enabled=true LIMIT 1")]);
     const previous=(await query<{btc_regime:string}>("SELECT btc_regime FROM indicator_snapshots WHERE btc_regime IS NOT NULL ORDER BY closed_at DESC LIMIT 1")).rows[0]?.btc_regime as "BULL"|"BEAR"|"RANGE"|"TRANSITION"|undefined;
     const dailyClosed=daily.filter((candle)=>candle.openTime+24*60*60_000<=closedAt.getTime());
     const fourHourClosed=fourHour.filter((candle)=>candle.openTime+4*60*60_000<=closedAt.getTime());
@@ -118,9 +149,10 @@ async function scan(){
     scanRunId=run.rows[0]!.id;
     let success=0;
     const heatmapRange=strategy.rows[0]?.heatmap_range??"24h";
+    const heatmapNotBefore=await requestHeatmapRefresh(closedAt,heatmapRange);
     const pending=[...assets.rows] as Record<string,unknown>[];
     const workers=Array.from({length:Math.min(5,pending.length)},async()=>{
-      while(pending.length){const asset=pending.shift();if(asset&&await collectAsset(asset,btc.regime,closedAt,scanRunId!,heatmapRange))success+=1;}
+      while(pending.length){const asset=pending.shift();if(asset&&await collectAsset(asset,btc.regime,closedAt,scanRunId!,heatmapRange,heatmapNotBefore))success+=1;}
     });
     await Promise.all(workers);
     const failure=(assets.rowCount??0)-success;
@@ -128,6 +160,7 @@ async function scan(){
     await recordHealth("market-collector",failure===0,failure?`${failure} asset(s) paused during scan`:undefined,false);
   }catch(error){
     if(scanRunId)await query("UPDATE scan_runs SET completed_at=now(),status='FAILED',error=$1 WHERE id=$2",[error instanceof Error?error.message:String(error),scanRunId]);
+    if(!binanceHealthy)await recordHealth("binance",false,error,true);
     await recordHealth("market-collector",false,error,true);
   }
 }
@@ -137,6 +170,7 @@ async function prewarmAll(){
   const assets=await query<Record<string,unknown>>("SELECT * FROM assets WHERE collect_enabled=true AND paused=false ORDER BY code");
   let failures=0;
   for(const asset of assets.rows){try{await prewarmAsset(asset);}catch(error){failures+=1;const reason=error instanceof Error?error.message:String(error);await recordBusinessError({service:"market-collector",assetId:String(asset.id),code:"ASSET_PREWARM_FAILED",message:reason,blocksTrading:true,context:{symbol:String(asset.binance_symbol)}});await query("UPDATE assets SET paused=true,pause_reason=$1,updated_at=now() WHERE id=$2",[`PREWARM_ERROR: ${reason}`.slice(0,500),asset.id]);}}
+  await recordHealth("binance",failures===0,failures?`${failures} Binance prewarm request(s) failed`:undefined,failures>0);
   await recordHealth("market-collector",failures===0,failures?`${failures} asset(s) failed prewarm`:undefined,false);
 }
 await prewarmAll();
