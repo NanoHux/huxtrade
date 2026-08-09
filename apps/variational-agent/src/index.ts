@@ -574,7 +574,18 @@ async function submitOrder(item:Record<string,unknown>,orderId:string,orderPlan:
         return;
       }
       const plan={...payload.plan,marginUsdc:adjusted.marginUsdc,notionalUsdc:adjusted.notionalUsdc};
-      await query("UPDATE orders SET margin_usdc=$1 WHERE id=$2",[adjusted.marginUsdc,payload.orderId]);
+      // Record what the stop was worth against the spread even when it passes.
+      // Refusals already carry these numbers in their message, but a threshold
+      // set from refusals alone is fitted to the tail — the 4x multiple is
+      // provisional precisely because the only evidence for it was five
+      // rejections across three assets. Folded into the margin update rather
+      // than issued as its own query: this is the order-submission path.
+      await query("UPDATE orders SET margin_usdc=$1,entry_provenance=coalesce(entry_provenance,'{}'::jsonb)||$3::jsonb WHERE id=$2",[
+        adjusted.marginUsdc,payload.orderId,
+        JSON.stringify(spread!==undefined&&spread>0
+          ?{quotedSpread:spread,stopDistance,stopSpreadRatio:Number((stopDistance/spread).toPrecision(6))}
+          :{quotedSpread:null,stopDistance})
+      ]);
       submissionAttempted=true;
       const conflict=await resolveAssetConflict(order.asset_id,plan.direction,payload.orderId);
       // Only when this submission is about to create its own pair. A
