@@ -163,7 +163,10 @@ async function reconcileOpenOrders():Promise<unknown>{
       }else if(order.reconcile_misses>0)await query("UPDATE orders SET reconcile_misses=0 WHERE id=$1",[order.id]);
       // Only after the sync above, so a position that has just reached its
       // target or stop is booked as closed rather than scaled out of.
-      if(remote.state==="FILLED_OPEN"&&order.state==="FILLED_OPEN")await maybeScaleOut(order,remote);
+      if(remote.state==="FILLED_OPEN"&&order.state==="FILLED_OPEN"){
+        await recordPeakExcursion(order,remote);
+        await maybeScaleOut(order,remote);
+      }
     }
     return undefined;
   }catch(error){return error;}
@@ -307,6 +310,26 @@ async function maybeScaleOut(order:ReconcilableOrder,remote:PlatformTrackedOrder
  * still surfaced inside two minutes.
  */
 const filledOpenMissLimit=3;
+
+/**
+ * Keeps the high-water mark of unrealised profit, measured in stop-widths on
+ * the venue's own mark price — the same number the scale-out trigger reads.
+ *
+ * Without it there is no way to answer "should this have scaled out?" after
+ * the fact: DEXE ran 0.99R in favour on Binance and never triggered, and
+ * positions.unrealized_pnl is overwritten every sweep, so nothing recorded
+ * whether Variational's mark ever agreed. Written only when it rises, so the
+ * common case is a no-op update.
+ */
+async function recordPeakExcursion(order:ReconcilableOrder,remote:PlatformTrackedOrder){
+  const markPrice=Number((remote.position?.raw as Record<string,unknown>|undefined)?.mark_price);
+  if(!Number.isFinite(markPrice))return;
+  const entryPrice=Number(order.entry_price),stopLoss=Number(order.stop_loss);
+  const risk=order.direction==="LONG"?entryPrice-stopLoss:stopLoss-entryPrice;
+  if(!(risk>0))return;
+  const profitR=(order.direction==="LONG"?markPrice-entryPrice:entryPrice-markPrice)/risk;
+  await query("UPDATE orders SET peak_favourable_r=greatest(coalesce(peak_favourable_r,$1),$1) WHERE id=$2",[Number(profitR.toPrecision(6)),order.id]);
+}
 
 /**
  * Marks a refusal the same plan will reproduce, so signal-engine can rest the

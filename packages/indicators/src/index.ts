@@ -18,11 +18,27 @@ export function median(values: number[]): number {
   return sorted.length % 2 ? sorted[middle]! : (sorted[middle - 1]! + sorted[middle]!) / 2;
 }
 
+/**
+ * False only when the baseline had no scale at all.
+ *
+ * Deliberately not a magnitude cap. A large z is an extreme observation, not
+ * a broken statistic: CYS carries a full month of Binance history with 3002
+ * distinct OI samples, and its 14.12 is what a genuinely violent hour looks
+ * like against its own distribution. What is broken is a MAD of exactly zero
+ * — CYS's funding sat on one value for more than half of 3006 samples, which
+ * produced an infinite z that satisfied every |z| >= threshold test it met.
+ */
+export function usableZScore(zScore: number): boolean {
+  return Number.isFinite(zScore);
+}
+
 export function robustZScore(value: number, history: number[]): number {
   if (history.length < 5) throw new Error("robustZScore requires at least 5 observations");
   const center = median(history);
   const mad = median(history.map((x) => Math.abs(x - center)));
-  if (mad === 0) return value === center ? 0 : Math.sign(value - center) * Number.POSITIVE_INFINITY;
+  // NaN, not Infinity: a zero MAD is the absence of a scale, and Infinity
+  // silently satisfies every |z| >= threshold test it is fed into.
+  if (mad === 0) return value === center ? 0 : Number.NaN;
   return 0.67448975 * (value - center) / mad;
 }
 
@@ -144,6 +160,10 @@ export function oiAnomaly(input: { values: number[]; baselineSamples?: number; z
   const current = changes.at(-1)!;
   const baseline = changes.slice(-(baselineSamples + 1), -1);
   const zScore = robustZScore(current, baseline);
+  // A baseline without dispersion cannot judge this asset yet, which is the
+  // same state as not having enough samples — report it as such rather than
+  // passing on a number the statistic cannot support.
+  if (!usableZScore(zScore)) return { ready: false, value: current, zScore, direction: 0 as -1 | 0 | 1, passed: false, sampleCount: baseline.length };
   const direction = confirmedDirection(changes, 2, 3);
   return { ready: true, value: current, zScore, direction, passed: Math.abs(zScore) >= (input.zThreshold ?? 1) && direction !== 0, sampleCount: baseline.length };
 }
@@ -154,6 +174,7 @@ export function cvdAnomaly(input: { currentBins: number[]; history: number[]; ba
   if (input.history.length < baselineSamples) return { ready:false, value, zScore:0, direction:0 as -1|0|1, passed:false, sampleCount:input.history.length };
   const baseline = input.history.slice(-baselineSamples);
   const zScore = robustZScore(value, baseline);
+  if (!usableZScore(zScore)) return { ready:false, value, zScore, direction:0 as -1|0|1, passed:false, sampleCount:baseline.length };
   // Unanimous, not a majority. With three bins a 2-of-3 majority is not a
   // filter at all — measured over 4032 fifteen-minute bars across six assets
   // it produced a direction 100% of the time, because failing it needs one
@@ -185,6 +206,10 @@ export function fundingAnomaly(input: { values: number[]; baselineSamples?: numb
   const change4h = changes4h.at(-1)!;
   const currentZ = robustZScore(current, currentBaseline);
   const changeZ = robustZScore(change4h, changeBaseline);
+  // Funding sits flat for long stretches on a freshly listed asset, so this
+  // is the pair most likely to produce a zero-MAD baseline. Both halves feed
+  // the same score, so either being unusable makes the score meaningless.
+  if (!usableZScore(currentZ) || !usableZScore(changeZ)) return { ready:false, value:current, change4h, currentZ, changeZ, score:0, passed:false, sampleCount:Math.min(currentBaseline.length,changeBaseline.length) };
   const score = Math.max(Math.abs(currentZ), Math.abs(changeZ));
   return { ready:true, value:current, change4h, currentZ, changeZ, score, passed:score>=(input.zThreshold??1), sampleCount:Math.min(currentBaseline.length,changeBaseline.length) };
 }

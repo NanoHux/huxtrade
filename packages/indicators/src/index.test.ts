@@ -17,7 +17,10 @@ describe("deterministic indicators", () => {
   });
   it("uses a one-hour change for OI and 2-of-3 direction confirmation", () => {
     expect(rollingChange([100, 101, 102, 103, 104], 4)).toEqual([0.04]);
-    const values=Array.from({length:30},(_,i)=>100+i*0.1);
+    // Dispersed on purpose. A smooth ramp makes every 1h change identical,
+    // which shrinks the MAD to a rounding artefact and yields a z in the
+    // thousands — a fixture that would assert nothing about the threshold.
+    const values=Array.from({length:30},(_,i)=>100+i*0.1+(i%3===0?1.5:i%3===1?-0.9:0.4));
     values.push(110,111,112,113,120);
     const result=oiAnomaly({values,baselineSamples:20});
     expect(result.ready).toBe(true);
@@ -30,8 +33,13 @@ describe("deterministic indicators", () => {
   });
   it("uses an absolute rate difference for the four-hour Funding change",()=>{
     expect(rollingDifference([0.001,0.002,0.004],2)).toEqual([0.003]);
-    const values=Array(27).fill(0.001) as number[];
-    values[26]=0.003;
+    // Irregular by design. A constant funding baseline has a MAD of zero on
+    // both the level and the 4h difference, which is the CYS pathology, not a
+    // fixture: the z comes back infinite and passes every threshold. Real
+    // funding does move — BTC's baseline MAD is 1.78e-5.
+    const steps=[0,2,1,4,2,5,1,3,6,2,4,1,5,3,2,6,1,4,2,5,3,1,6,2,4,3,0];
+    const values=steps.map((step)=>0.001+step*0.00002);
+    values[26]=values[10]!+0.002;
     const result=fundingAnomaly({values,baselineSamples:10});
     expect(result.ready).toBe(true);
     expect(result.change4h).toBeCloseTo(0.002);
@@ -50,6 +58,8 @@ describe("deterministic indicators", () => {
 });
 
 describe("CVD direction requires every bin to agree",()=>{
+  // A two-value alternation still has a real MAD (110), so the baseline is
+  // usable; the bins are what these tests are about.
   const history=Array.from({length:2880},(_,i)=>i%2?120:-100);
 
   it("confirms only when all three five-minute bins point the same way",()=>{
@@ -79,5 +89,33 @@ describe("CVD direction requires every bin to agree",()=>{
     expect(cvdAnomaly({currentBins:[-500,-400,0],history}).direction).toBe(0);
     expect(cvdAnomaly({currentBins:[0,0,0],history}).direction).toBe(0);
     expect(cvdAnomaly({currentBins:[],history}).direction).toBe(0);
+  });
+});
+
+describe("a baseline with no scale cannot judge anything",()=>{
+  // CYS's funding sat on one value for more than half of 3006 samples, so the
+  // MAD was exactly zero and the z came back infinite — which passed every
+  // |z| >= threshold test it was fed into, on an asset the statistic could
+  // not actually speak about.
+  it("reports funding as un-warmed rather than infinitely anomalous",()=>{
+    const flat=Array(200).fill(0.0001);
+    const result=fundingAnomaly({values:[...flat,0.05],baselineSamples:100});
+    expect(result.ready).toBe(false);
+    expect(result.passed).toBe(false);
+  });
+
+  it("does the same for OI and CVD",()=>{
+    expect(oiAnomaly({values:[...Array(200).fill(100),140],baselineSamples:100}).ready).toBe(false);
+    expect(cvdAnomaly({currentBins:[9,9,9],history:Array(200).fill(50),baselineSamples:100}).ready).toBe(false);
+  });
+
+  it("still accepts a genuinely extreme reading on a baseline that has scale",()=>{
+    // 24x the typical magnitude, on a baseline with a real MAD: extreme, not
+    // degenerate, and the model is entitled to act on it.
+    const history=Array.from({length:2880},(_,i)=>i%2?120:-100);
+    const result=cvdAnomaly({currentBins:[-800,-800,-800],history});
+    expect(result.ready).toBe(true);
+    expect(Math.abs(result.zScore)).toBeGreaterThan(10);
+    expect(result.direction).toBe(-1);
   });
 });
