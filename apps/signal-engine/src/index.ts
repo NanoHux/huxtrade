@@ -219,7 +219,7 @@ async function run(){
       for(const direction of directions){
         const rawConditions:ConditionResult[]=[
           {type:"OI",passed:Boolean(row.oi_passed),value:Number(row.oi_change_1h),zScore:Number(row.oi_z),reason:Boolean(row.oi_passed)?"1h OI anomaly and 2-of-3 direction confirmed":"OI 1h threshold/confirmation not met"},
-          {type:"CVD",passed:Boolean(row.cvd_passed)&&derived===direction,value:Number(row.cvd_value),zScore:Number(row.cvd_z),direction,reason:Boolean(row.cvd_passed)&&derived===direction?"15m CVD anomaly and 2-of-3 5m direction confirmed":"CVD threshold/confirmation not met"},
+          {type:"CVD",passed:Boolean(row.cvd_passed)&&derived===direction,value:Number(row.cvd_value),zScore:Number(row.cvd_z),direction,reason:Boolean(row.cvd_passed)&&derived===direction?"15m CVD anomaly and all 3 of the 5m bins agree on direction":"CVD threshold/confirmation not met"},
           {type:"FUNDING",passed:Boolean(row.funding_passed),value:Number(row.funding_value),zScore:Math.max(Math.abs(Number(row.funding_z)),Math.abs(Number(row.funding_change_z))),reason:Boolean(row.funding_passed)?"Funding level or 4h amplitude is anomalous":"Funding anomaly not met"},
           {type:"HEATMAP",passed:Boolean(row.heatmap_passed),reason:Boolean(row.heatmap_passed)?"Eligible Binance heatmap region exists":"No eligible heatmap region"}
         ];

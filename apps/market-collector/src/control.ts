@@ -16,7 +16,7 @@ export interface CvdCandle{openTime:number;quoteVolume?:number;takerBuyQuoteVolu
 
 /**
  * Signed taker flow for a 15-minute scan, split into the three 5-minute bins
- * cvdAnomaly needs for its 2-of-3 direction confirmation.
+ * cvdAnomaly needs for its unanimous direction confirmation.
  *
  * `2 * takerBuyQuote - quoteVolume` is exactly taker-buy minus taker-sell:
  * with B the taker-buy quote volume and S the taker-sell, quoteVolume is B+S,
