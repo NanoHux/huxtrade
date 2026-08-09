@@ -1,5 +1,5 @@
 import { afterEach,describe,expect,it,vi } from "vitest";
-import { BinanceFuturesClient,buildCoinGlassHeatmapPageUrl,normalizeCoinGlassWebHeatmap,parseCoinGlassHeatmapUrl,variationalUnderlying } from "./index.js";
+import { BinanceFuturesClient,buildCoinGlassHeatmapPageUrl,intervalMs,normalizeCoinGlassWebHeatmap,parseCoinGlassHeatmapUrl,variationalUnderlying } from "./index.js";
 
 const trade=(id:number,time:number)=>({a:id,p:"100",q:"1",T:time,m:false});
 
@@ -80,5 +80,48 @@ describe("single-character tickers",()=>{
   it("still rejects a coin parameter that is not a ticker at all",()=>{
     expect(()=>parseCoinGlassHeatmapUrl("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=&type=pair")).toThrow(/invalid coin/);
     expect(()=>parseCoinGlassHeatmapUrl("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC-PERP&type=pair")).toThrow(/invalid coin/);
+  });
+});
+
+describe("request weight, not just request count",()=>{
+  // Binance charges klines by the limit ASKED FOR: 1 up to 100, 2 to 500,
+  // 5 to 1000, 10 beyond. A flat limit of 1500 made three 5m candles cost as
+  // much as a month of history.
+  const capture=()=>{
+    const seen:URL[]=[];
+    const fetchMock=async(input:string|URL)=>{
+      const url=new URL(String(input));seen.push(url);
+      return new Response(JSON.stringify([]),{status:200,headers:{"content-type":"application/json"}});
+    };
+    return {seen,fetchMock};
+  };
+
+  it("asks for only as many candles as the range can hold",async()=>{
+    const {seen,fetchMock}=capture();
+    const original=globalThis.fetch;globalThis.fetch=fetchMock as typeof fetch;
+    try{
+      const end=Date.UTC(2026,7,9,12,0,0);
+      await new BinanceFuturesClient("https://example.test").klinesRange("BTCUSDT","5m",end-15*60_000,end);
+      // Three 5m candles in the window, plus one for the boundary.
+      expect(seen[0]!.searchParams.get("limit")).toBe("4");
+    }finally{globalThis.fetch=original;}
+  });
+
+  it("still asks for full pages when backfilling a month",async()=>{
+    const {seen,fetchMock}=capture();
+    const original=globalThis.fetch;globalThis.fetch=fetchMock as typeof fetch;
+    try{
+      const end=Date.UTC(2026,7,9,12,0,0);
+      await new BinanceFuturesClient("https://example.test").klinesRange("BTCUSDT","5m",end-30*86_400_000,end);
+      expect(seen[0]!.searchParams.get("limit")).toBe("1500");
+    }finally{globalThis.fetch=original;}
+  });
+
+  it("maps every interval unit the collector uses",()=>{
+    expect(intervalMs("5m")).toBe(300_000);
+    expect(intervalMs("1h")).toBe(3_600_000);
+    expect(intervalMs("4h")).toBe(14_400_000);
+    expect(intervalMs("1d")).toBe(86_400_000);
+    expect(()=>intervalMs("1y")).toThrow(/Unsupported/);
   });
 });

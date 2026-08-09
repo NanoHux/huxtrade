@@ -16,6 +16,8 @@ export interface VariationalAdapter extends ProtectionAdapter{
   sessionValid():Promise<boolean>;
   account():Promise<{balanceUsdc:number;marginUsagePercent:number}>;
   minimumMargin(plan:OrderPlan):Promise<number>;
+  /** The venue's quoted spread for this plan, used to refuse a stop too narrow to survive its own round trip. */
+  quotedSpread(plan:OrderPlan):Promise<number|undefined>;
   listTracked(orders:TrackedOrderRef[]):Promise<PlatformTrackedOrder[]>;
   cancelPending():Promise<Array<{id:string;cancelled:boolean}>>;
   /** How many active TP/SL orders the instrument currently holds. Variational allows exactly one pair. */
@@ -195,10 +197,29 @@ export class OmniBrowserAdapter implements VariationalAdapter{
     const prepared={plan,instrument,side,qty,quote,prices};this.prepared.set(plan.idempotencyKey,prepared);return prepared;
   }
 
+  /**
+   * The margin the venue will actually consume for this plan.
+   *
+   * Derived from the quantity `prepare` has decided to submit, NOT from
+   * `min_qty` on the quote. prepare() silently raises a sub-minimum order to
+   * the venue floor, and the re-quote it then issues reports limits relative
+   * to that larger size — so reading min_qty back off the prepared quote asks
+   * the question after the answer has already changed it, and reports no
+   * problem. ON was planned at 100 USDC of margin, submitted at the venue's
+   * 1500 USDC minimum notional (3x the intended risk), and recorded as 100:
+   * the guard that exists to catch exactly this was blinded by its own cache.
+   */
+  /** The venue's own bid/ask spread for this plan's size, in price units. */
+  async quotedSpread(plan:OrderPlan){
+    const prepared=await this.prepare(plan);
+    const bid=optionalNumber(prepared.quote.bid),ask=optionalNumber(prepared.quote.ask);
+    return bid!==undefined&&ask!==undefined&&ask>bid?ask-bid:undefined;
+  }
+
   async minimumMargin(plan:OrderPlan){
-    const prepared=await this.prepare(plan),limits=record(record(prepared.quote.qty_limits,"quote quantity limits")[prepared.side==="buy"?"ask":"bid"],"side quantity limits");
-    const minimum=number(limits.min_qty,"minimum quantity"),price=number(prepared.side==="buy"?prepared.quote.ask:prepared.quote.bid,"quote price");
-    return minimum*price/plan.leverage;
+    const prepared=await this.prepare(plan);
+    const price=number(prepared.side==="buy"?prepared.quote.ask:prepared.quote.bid,"quote price");
+    return Number(prepared.qty)*price/plan.leverage;
   }
 
   async submitEntry(value:Record<string,unknown>,options?:{skipProtection?:boolean}):Promise<PlatformEntry>{
@@ -513,7 +534,23 @@ export class OmniBrowserAdapter implements VariationalAdapter{
         continue;
       }
       const liquidation=trades.find((trade)=>sameInstrument(trade.instrument,entryTrade.instrument)&&String(trade.trade_type).toLowerCase()==="liquidation"&&new Date(String(trade.created_at))>new Date(String(entryTrade.created_at)));
-      const exitTrade=liquidation??trades.find((trade)=>sameInstrument(trade.instrument,entryTrade.instrument)&&trade.side!==entryTrade.side&&new Date(String(trade.created_at))>new Date(String(entryTrade.created_at))&&number(trade.qty,"exit trade quantity")>=number(entryTrade.qty,"entry trade quantity"));
+      // A position can now leave in more than one piece: the scale-out closes
+      // part of it and the survivor's stop closes the rest. Requiring ONE
+      // trade at least the size of the entry matched neither half, so a fully
+      // closed order looked like a position that had vanished — ON banked its
+      // scale-out, hit its breakeven stop, and was booked UNKNOWN.
+      const entryQty=number(entryTrade.qty,"entry trade quantity");
+      const closes=trades
+        .filter((trade)=>sameInstrument(trade.instrument,entryTrade.instrument)&&trade.side!==entryTrade.side&&new Date(String(trade.created_at))>new Date(String(entryTrade.created_at)))
+        .sort((a,b)=>new Date(String(a.created_at)).getTime()-new Date(String(b.created_at)).getTime());
+      let closedQty=0;const consumed:JsonRecord[]=[];
+      for(const trade of closes){
+        if(closedQty>=entryQty-1e-9)break;
+        closedQty+=number(trade.qty,"exit trade quantity");consumed.push(trade);
+      }
+      // The LAST piece is the exit that decides the outcome: it is the one
+      // whose price says which protection fired.
+      const exitTrade=liquidation??(closedQty>=entryQty-1e-9?consumed[consumed.length-1]:undefined);
       const realized=exitTrade?transfers.find((transfer)=>transfer.rfq_id===exitTrade.source_rfq&&transfer.transfer_type==="realized_pnl"):undefined;
       if(exitTrade)fills.push(this.fillSnapshot(exitTrade,realized?optionalNumber(realized.qty):undefined));
       // The rfq that SOURCED the exit trade says why the position closed.

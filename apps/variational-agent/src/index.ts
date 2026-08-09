@@ -1,6 +1,6 @@
 import { fixedRules,getConfig } from "@huxtrade/config";
 import { claimRestartRequest,pool,query,recordBusinessError,recordHealth,transaction } from "@huxtrade/database";
-import { adjustMarginForPlatformMinimum,assertOrderTransition,breakevenStopPrice,breakevenThroughMarket,marginPauseTransition,resolveRestingEntry,scaleOutDecision } from "@huxtrade/strategy-engine";
+import { adjustMarginForPlatformMinimum,assertOrderTransition,breakevenStopPrice,breakevenThroughMarket,marginPauseTransition,resolveRestingEntry,scaleOutDecision,stopClearsSpread } from "@huxtrade/strategy-engine";
 import { variationalUnderlying } from "@huxtrade/exchange-clients";
 import type { OrderPlan,OrderState } from "@huxtrade/shared-types";
 import { decideAssetConflict,decideReversalClose,notificationTopicsForTransition,reconcileProtectionState,submitWithInitialProtection,type PlatformEntry,type PlatformEntryState,type PlatformProtection,type PlatformTrackedOrder,type ProtectionAdapter } from "./execution.js";
@@ -13,6 +13,7 @@ class DisabledAdapter implements VariationalAdapter{
   async sessionValid(){return false;}
   async account():Promise<{balanceUsdc:number;marginUsagePercent:number}>{throw new Error("Variational adapter is disabled");}
   async minimumMargin(_plan:OrderPlan):Promise<number>{throw new Error("Variational adapter is disabled");}
+  async quotedSpread(_plan:OrderPlan):Promise<number|undefined>{return undefined;}
   async submitEntry(_plan:Record<string,unknown>):Promise<PlatformEntry>{throw new Error("Variational adapter is disabled");}
   async placeTakeProfit(_entry:PlatformEntry,_plan:OrderPlan):Promise<PlatformProtection>{throw new Error("Variational adapter is disabled");}
   async placeStopLoss(_entry:PlatformEntry,_plan:OrderPlan):Promise<PlatformProtection>{throw new Error("Variational adapter is disabled");}
@@ -78,7 +79,11 @@ async function persistPlatformDetails(order:{id:string;asset_id:string},remote:P
         position.id,position.quantity,position.entryPrice,position.takeProfit??null,position.stopLoss??null,position.unrealizedPnl??null,position.realizedPnl??null,position.openedAt,position.closedAt??null,JSON.stringify(position.raw),order.id
       ]);
       positionId=saved.rows[0]?.id??null;
-      if(position.realizedPnl!==undefined)await client.query("UPDATE orders SET realized_pnl=$1,updated_at=now() WHERE id=$2",[position.realizedPnl,order.id]);
+      // The venue's aggregate rpnl already contains whatever the scale-out
+      // realised, and scaled_out_pnl records that separately — copying it
+      // wholesale counted ON's +7.16 twice. realized_pnl means "the final
+      // exit" (see migration 016), so the banked half is subtracted back out.
+      if(position.realizedPnl!==undefined)await client.query("UPDATE orders SET realized_pnl=$1-coalesce(scaled_out_pnl,0),updated_at=now() WHERE id=$2",[position.realizedPnl,order.id]);
     }
     for(const fill of remote.fills??[]){
       await client.query(`INSERT INTO fills(order_id,position_id,platform_fill_id,side,price,quantity,fee,realized_pnl,filled_at,raw_platform_state)
@@ -100,7 +105,7 @@ const unknownReleaseMissLimit=10;
 
 async function reconcileOpenOrders():Promise<unknown>{
   try{
-    const local=await query<ReconcilableOrder>(`SELECT o.id,o.asset_id,o.platform_order_id,o.state,o.direction,o.entry_price,o.stop_loss,o.take_profit,o.scaled_out_at,o.breakeven_stop_price,a.code,a.binance_symbol,a.variational_url
+    const local=await query<ReconcilableOrder>(`SELECT o.id,o.asset_id,o.platform_order_id,o.state,o.direction,o.entry_price,o.stop_loss,o.take_profit,o.scaled_out_at,o.breakeven_stop_price,o.reconcile_misses,a.code,a.binance_symbol,a.variational_url
       FROM orders o JOIN assets a ON a.id=o.asset_id WHERE o.state IN ('PENDING_ENTRY','FILLED_OPEN','UNKNOWN','RECONCILIATION_REQUIRED')`);
     if(!local.rows.length)return undefined;
     // The local levels travel with the id so listTracked can attribute an exit
@@ -141,10 +146,21 @@ async function reconcileOpenOrders():Promise<unknown>{
           continue;
         }
       }
-      if(remote.state!==order.state){
-        try{await setState(order.id,order.state,remote.state,"30-second Variational authoritative sync",remote.raw);}
-        catch{if(order.state!=="RECONCILIATION_REQUIRED")await setState(order.id,order.state,"RECONCILIATION_REQUIRED","platform state cannot follow local transition table",remote.raw);}
+      // A filled position that the venue momentarily does not report is the
+      // normal shape of a settling partial close, not a lost order. Condemning
+      // it on the first sweep flipped a healthy, protected ON position into
+      // UNKNOWN — from which orders carrying an rfq id are never released.
+      if(remote.state==="UNKNOWN"&&order.state==="FILLED_OPEN"){
+        const misses=await query<{reconcile_misses:number}>("UPDATE orders SET reconcile_misses=reconcile_misses+1,updated_at=now() WHERE id=$1 RETURNING reconcile_misses",[order.id]);
+        if((misses.rows[0]?.reconcile_misses??0)<filledOpenMissLimit)continue;
       }
+      if(remote.state!==order.state){
+        try{
+          await setState(order.id,order.state,remote.state,"30-second Variational authoritative sync",remote.raw);
+          await query("UPDATE orders SET reconcile_misses=0 WHERE id=$1",[order.id]);
+        }
+        catch{if(order.state!=="RECONCILIATION_REQUIRED")await setState(order.id,order.state,"RECONCILIATION_REQUIRED","platform state cannot follow local transition table",remote.raw);}
+      }else if(order.reconcile_misses>0)await query("UPDATE orders SET reconcile_misses=0 WHERE id=$1",[order.id]);
       // Only after the sync above, so a position that has just reached its
       // target or stop is booked as closed rather than scaled out of.
       if(remote.state==="FILLED_OPEN"&&order.state==="FILLED_OPEN")await maybeScaleOut(order,remote);
@@ -155,7 +171,7 @@ async function reconcileOpenOrders():Promise<unknown>{
 
 interface ReconcilableOrder{
   id:string;asset_id:string;platform_order_id:string;state:string;
-  direction:string;entry_price:string;stop_loss:string;take_profit:string;scaled_out_at:string|null;breakeven_stop_price:string|null;
+  direction:string;entry_price:string;stop_loss:string;take_profit:string;scaled_out_at:string|null;breakeven_stop_price:string|null;reconcile_misses:number;
   code:string;binance_symbol:string;variational_url:string|null;
 }
 
@@ -282,6 +298,24 @@ async function maybeScaleOut(order:ReconcilableOrder,remote:PlatformTrackedOrder
     orderId:order.id,code:order.code,direction,breakevenStop:breakeven,error:message,
     remainderClosed:!closeError,closeError,manualIntervention:Boolean(closeError)
   })]);
+}
+
+/**
+ * How many consecutive sweeps may fail to see a filled position before it is
+ * treated as gone. Three is ~90 seconds — long enough to ride out the gap
+ * while a partial close settles, short enough that a genuinely lost order is
+ * still surfaced inside two minutes.
+ */
+const filledOpenMissLimit=3;
+
+/**
+ * Marks a refusal the same plan will reproduce, so signal-engine can rest the
+ * asset instead of rebuilding it every 15 minutes. Deliberately NOT recorded
+ * for transient venue refusals or network errors — retrying is right there.
+ */
+async function recordStructuralRejection(assetId:string,reason:string){
+  await recordBusinessError({service:"variational-agent",assetId,code:"ORDER_STRUCTURALLY_REJECTED",
+    message:reason,blocksTrading:false,context:{}});
 }
 
 const reversalBackfillWindowMinutes=30;
@@ -518,9 +552,25 @@ async function submitOrder(item:Record<string,unknown>,orderId:string,orderPlan:
       const requiredMargin=await adapter.minimumMargin(payload.plan);
       const adjusted=adjustMarginForPlatformMinimum(config.DEFAULT_MARGIN_USDC,requiredMargin,config.MAX_MARGIN_USDC,config.LEVERAGE);
       if(!adjusted.accepted){
+        // Structural too: the venue's minimum exceeds the margin cap and will
+        // keep doing so until one of the two numbers changes.
         await setState(payload.orderId,"SUBMITTING","SUBMISSION_FAILED",adjusted.reason);
+        await recordStructuralRejection(order.asset_id,adjusted.reason);
         await query("UPDATE outbox SET status='sent',sent_at=now() WHERE id=$1",[item.id]);
-        await pauseAssetIfSubmissionsKeepFailing(order.asset_id);
+        return;
+      }
+      // Refused here rather than in the plan: only the venue knows the spread,
+      // and a stop that cannot clear it turns the trade into a round trip paid
+      // out of its own risk budget. PAXG planned a 0.064% stop against a
+      // 0.059% spread — it would have opened most of the way to its stop.
+      const spread=await adapter.quotedSpread(payload.plan);
+      const stopDistance=Math.abs(payload.plan.entryPrice-payload.plan.stopLoss);
+      const settings=await scaleOutSettings();
+      if(!stopClearsSpread(stopDistance,spread??0,settings)){
+        const why=`the ${stopDistance.toPrecision(6)} stop is under ${settings.minStopSpreadMultiple}x the ${spread?.toPrecision(6)} quoted spread`;
+        await setState(payload.orderId,"SUBMITTING","SUBMISSION_FAILED",why,undefined,"VENUE_LIMIT");
+        await recordStructuralRejection(order.asset_id,why);
+        await query("UPDATE outbox SET status='sent',sent_at=now() WHERE id=$1",[item.id]);
         return;
       }
       const plan={...payload.plan,marginUsdc:adjusted.marginUsdc,notionalUsdc:adjusted.notionalUsdc};

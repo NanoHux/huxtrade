@@ -134,6 +134,16 @@ export function formatBreakevenStopFailed(payload:Record<string,unknown>){
   ].join("\n");
 }
 
+export function formatOrderDesynced(payload:Record<string,unknown>,order?:OrderContext){
+  const state=String(payload.toState??"");
+  const label=state==="CANCELLED_EXTERNALLY"?"挂单已被平台取消":"订单状态与平台不一致";
+  return [
+    `[HuxTrade] ⚠️ ${label}${order?` - ${order.code} ${directionLabel(order.direction)}`:""}`,
+    `原因：${translateReason(String(payload.reason??"未知"))}`,
+    state==="CANCELLED_EXTERNALLY"?"平台侧已无此挂单，系统不再跟踪":"仓位与止盈止损仍由平台看管，需要人工核对账本"
+  ].join("\n");
+}
+
 export function formatDirectionHalted(payload:Record<string,unknown>){
   const until=payload.until?new Date(String(payload.until)).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false}):"—";
   return [

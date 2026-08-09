@@ -7,6 +7,14 @@ import type { HeatmapRegion } from "@huxtrade/shared-types";
 import { cvdBinsFromCandles, isRetryablePause, scanningPaused } from "./control.js";
 
 const binance = new BinanceFuturesClient();
+/**
+ * Consecutive failed collections per asset, in memory only. A restart clears
+ * it, which errs toward giving an asset another chance rather than toward
+ * pausing one that is healthy.
+ */
+const collectionFailures = new Map<string,number>();
+/** Failures in a row before an asset is actually paused. Two scans is ~30 minutes of evidence. */
+const collectionFailureLimit = 2;
 const sleep = (ms:number) => new Promise((resolve) => setTimeout(resolve, ms));
 const quarterMs = 15 * 60_000;
 const baselineSamples = 30 * 24 * 4;
@@ -86,12 +94,37 @@ async function requestHeatmapRefresh(closedAt:Date,heatmapRange:string,assetCoun
   return requestedAt;
 }
 
-async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closedAt:Date,scanRunId:string,heatmapRange:string,heatmapNotBefore:Date):Promise<boolean>{
+/**
+ * The last SETTLED funding rate, cached for the clock hour it belongs to.
+ *
+ * Settlement happens hourly at most, so refetching every 15 minutes asked the
+ * same question four times for one answer. Deliberately NOT taken from the
+ * batched /premiumIndex, whose lastFundingRate is the live prediction rather
+ * than the settled print — measured 0.00025214 against 0.00020221 for ON on
+ * the same second. The 30-day FUNDING_RAW baseline is built from settled
+ * values, and comparing a prediction against it would measure the metric and
+ * its own baseline with two different rulers.
+ */
+const fundingByHour=new Map<string,{hour:number;rate:number}>();
+async function settledFundingRate(symbol:string,closedAt:Date){
+  const hour=Math.floor(closedAt.getTime()/3_600_000);
+  const cached=fundingByHour.get(symbol);
+  if(cached&&cached.hour===hour)return cached.rate;
+  const rate=Number((await binance.fundingHistory(symbol,8)).at(-1)?.fundingRate??0);
+  fundingByHour.set(symbol,{hour,rate});
+  return rate;
+}
+
+async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closedAt:Date,scanRunId:string,heatmapRange:string,heatmapNotBefore:Date,prices:Map<string,number>):Promise<boolean>{
   const id=String(asset.id),symbol=String(asset.binance_symbol);
   try{
     await prewarmAsset(asset);
-    const [price,oi,funding,candles5m,heatmapResult]=await Promise.all([
-      binance.latestPrice(symbol),binance.openInterest(symbol),binance.fundingHistory(symbol,8),
+    const batched=prices.get(symbol);
+    const [price,oi,fundingValue,candles5m,heatmapResult]=await Promise.all([
+      // One /ticker/price for the whole board costs 2; asking per symbol cost
+      // 46 and could half-fail, pausing whichever asset was in flight.
+      batched!==undefined?Promise.resolve(batched):binance.latestPrice(symbol),
+      binance.openInterest(symbol),settledFundingRate(symbol,closedAt),
       binance.klinesRange(symbol,"5m",closedAt.getTime()-quarterMs,closedAt.getTime()-1),
       query<{regions:HeatmapRegion[];captured_at:Date}>("SELECT regions,captured_at FROM coinglass_heatmaps WHERE asset_id=$1 AND heatmap_range=$2",[id,heatmapRange])
     ]);
@@ -110,7 +143,6 @@ async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closed
     // and its own baseline with two different rulers.
     const cvdBins=cvdBinsFromCandles(candles5m,closedAt.getTime()-quarterMs,closedAt.getTime());
     const cvd=cvdBins.reduce((sum,value)=>sum+value,0);
-    const fundingValue=Number(funding.at(-1)?.fundingRate??0);
     const [oiValues,cvdValues,fundingValues]=await Promise.all([
       metricValues(id,"OI_RAW",closedAt,oi.value,baselineSamples+8),
       metricValues(id,"CVD_15M",closedAt,cvd,baselineSamples+1),
@@ -134,6 +166,7 @@ async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closed
     // gone — safe to lift automatically. Pauses from real trading-state risk
     // (missing protection, ambiguous reconciliation) never take this path and
     // still require a human to look and clear them by hand.
+    collectionFailures.delete(id);
     if(Boolean(asset.paused)){
       await query("UPDATE assets SET paused=false,pause_reason=null,updated_at=now() WHERE id=$1",[id]);
       await query("INSERT INTO outbox(topic,payload) VALUES('notification.asset_resumed',$1)",[JSON.stringify({asset:String(asset.code),previousReason:String(asset.pause_reason??"")})]);
@@ -141,7 +174,27 @@ async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closed
     return true;
   }catch(error){
     const reason=error instanceof Error?error.message:String(error);
-    await recordBusinessError({service:"market-collector",assetId:id,code:"ASSET_COLLECTION_FAILED",message:reason,blocksTrading:true,context:{symbol}});
+    // One transient fetch is not a broken asset. Pausing on the first failure
+    // cost real money: a single Binance blip paused WLD, and the next scan's
+    // "asset not tradable" rule cancelled its healthy working order and lost
+    // its queue position. The failure rate is not constant either — it rose
+    // roughly tenfold when the whitelist went from 28 to 46 assets, so the
+    // single-failure rule got sharply more expensive exactly as the book grew.
+    //
+    // A stale heatmap counts the same as a fetch failure. Excluding it was
+    // wrong: the heatmap goes stale BECAUSE a capture timed out under load,
+    // which is a transient fault, and the refresh cycle already allows for it
+    // — captures run every 15 minutes against a 30-minute staleness bar, so
+    // missing one round is inside the designed tolerance. Pausing on the
+    // first miss spent that tolerance and cancelled the asset's working order
+    // (ZRO and BNB, both on 2026-08-09).
+    const failures=(collectionFailures.get(id)??0)+1;
+    collectionFailures.set(id,failures);
+    if(failures<collectionFailureLimit){
+      await recordBusinessError({service:"market-collector",assetId:id,code:"ASSET_COLLECTION_RETRYING",message:`${reason} (${failures}/${collectionFailureLimit}, not pausing yet)`,blocksTrading:false,context:{symbol}});
+      return false;
+    }
+    await recordBusinessError({service:"market-collector",assetId:id,code:"ASSET_COLLECTION_FAILED",message:reason,blocksTrading:true,context:{symbol,consecutiveFailures:failures}});
     await query("UPDATE assets SET paused=true,pause_reason=$1,updated_at=now() WHERE id=$2",[`DATA_ERROR: ${reason}`.slice(0,500),id]);
     await query("INSERT INTO outbox(topic,payload) VALUES('notification.system_error',$1)",[JSON.stringify({asset:String(asset.code),reason})]);
     return false;
@@ -177,9 +230,12 @@ async function scan(){
     let success=0;
     const heatmapRange=strategy.rows[0]?.heatmap_range??"24h";
     const heatmapNotBefore=await requestHeatmapRefresh(closedAt,heatmapRange,assetRows.length);
+    // One board-wide price read for the whole scan. A failure here is not
+    // fatal: each asset falls back to its own /ticker/price call.
+    const prices=await binance.allPrices().catch(()=>new Map<string,number>());
     const pending=[...assetRows];
     const workers=Array.from({length:Math.min(5,pending.length)},async()=>{
-      while(pending.length){const asset=pending.shift();if(asset&&await collectAsset(asset,btc.regime,closedAt,scanRunId!,heatmapRange,heatmapNotBefore))success+=1;}
+      while(pending.length){const asset=pending.shift();if(asset&&await collectAsset(asset,btc.regime,closedAt,scanRunId!,heatmapRange,heatmapNotBefore,prices))success+=1;}
     });
     await Promise.all(workers);
     const failure=assetRows.length-success;

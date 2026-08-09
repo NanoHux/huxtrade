@@ -193,6 +193,12 @@ export function notificationTopicsForTransition(from:OrderState,to:OrderState,ca
   // working as designed. The preference row ships disabled — 15 assets
   // revalidating every 15 minutes would otherwise flood the chat.
   if(to==="CANCELLED_REPLACED")return ["notification.resting_order_replaced"];
-  if(["SUBMISSION_FAILED","UNKNOWN","RECONCILIATION_REQUIRED","CANCELLED_EXTERNALLY"].includes(to))return ["notification.order_failed"];
+  // Only a submission that never made it onto the venue is a failed order.
+  // The other three are an order that DID reach the venue and whose local
+  // bookkeeping has come adrift — ON had filled, scaled out for +7.16 and was
+  // still protected when it reported "下单失败", which invites exactly the
+  // wrong response from an operator reading it at a glance.
+  if(to==="SUBMISSION_FAILED")return ["notification.order_failed"];
+  if(["UNKNOWN","RECONCILIATION_REQUIRED","CANCELLED_EXTERNALLY"].includes(to))return ["notification.order_desynced"];
   return [];
 }

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Direction, HeatmapRegion, OrderPlan } from "@huxtrade/shared-types";
-import { biasDecision, breakevenStopPrice, breakevenThroughMarket, chooseEntryLevel, classifyExitByPrice, directionAllowedAfterMove, haltedDirections, limitArmedAssets, makeRestingOrderPlan, neutralBias, resolveRestingEntry, restingEntryDefaults, revalidateWorkingOrder, scaleOutDecision, type BiasState, type EntryCandidate } from "./index.js";
+import { assetsInStructuralBackoff, biasDecision, breakevenStopPrice, breakevenThroughMarket, chooseEntryLevel, stopClearsSpread, classifyExitByPrice, directionAllowedAfterMove, haltedDirections, limitArmedAssets, makeRestingOrderPlan, neutralBias, resolveRestingEntry, restingEntryDefaults, revalidateWorkingOrder, scaleOutDecision, type BiasState, type EntryCandidate } from "./index.js";
 
 const region=(low:number,high:number,percentile:number,intensity=percentile*100):HeatmapRegion=>
   ({price:(low+high)/2,lowPrice:low,highPrice:high,intensity,percentile,rank:1});
@@ -644,5 +644,74 @@ describe("attributing an exit to a protection by price",()=>{
   it("refuses to guess on a degenerate or unusable set of levels",()=>{
     expect(classifyExitByPrice({direction:"LONG",entryPrice:100,stopLoss:100,takeProfit:106,exitPrice:99})).toBeNull();
     expect(classifyExitByPrice({direction:"LONG",entryPrice:100,stopLoss:98,takeProfit:106,exitPrice:Number.NaN})).toBeNull();
+  });
+});
+
+describe("refusing a stop too narrow to survive its own round trip",()=>{
+  it("refuses PAXG and accepts BTC, which a percentage floor cannot do",()=>{
+    // PAXG: 2.77 stop against a 2.56 spread — 1.08x.
+    expect(stopClearsSpread(2.77,2.56)).toBe(false);
+    // BTC: a 0.21% stop is ~134 in price against a spread near 1.
+    expect(stopClearsSpread(134,1)).toBe(true);
+    // Same two as a share of price: 0.064% vs 0.21%. Any flat floor that
+    // catches the first throws away the second.
+  });
+
+  it("takes the multiple from settings and treats the boundary as passing",()=>{
+    // Written against the configured multiple, not a literal, so retuning it
+    // does not silently turn this into a test of nothing.
+    const bar=restingEntryDefaults.minStopSpreadMultiple;
+    expect(stopClearsSpread(bar,1)).toBe(true);
+    expect(stopClearsSpread(bar-0.01,1)).toBe(false);
+    expect(stopClearsSpread(4,1,resolveRestingEntry({minStopSpreadMultiple:4}))).toBe(true);
+    expect(stopClearsSpread(3.9,1,resolveRestingEntry({minStopSpreadMultiple:4}))).toBe(false);
+  });
+
+  it("is switched off by a zero multiple",()=>{
+    expect(stopClearsSpread(0.001,10,resolveRestingEntry({minStopSpreadMultiple:0}))).toBe(true);
+    expect(resolveRestingEntry({minStopSpreadMultiple:0}).minStopSpreadMultiple).toBe(0);
+  });
+
+  it("does not block on an unusable spread, but does block a zero stop",()=>{
+    // A missing quote is ignorance, and the venue's own minimums still apply.
+    expect(stopClearsSpread(2.77,Number.NaN)).toBe(true);
+    expect(stopClearsSpread(2.77,0)).toBe(true);
+    expect(stopClearsSpread(0,1)).toBe(false);
+  });
+});
+
+describe("resting an asset whose submissions keep being refused on their own structure",()=>{
+  const at=(hours:number)=>new Date(Date.UTC(2026,7,9,0,0,0)+hours*3_600_000).toISOString();
+  const refusal=(assetId:string,hours:number)=>({assetId,at:at(hours)});
+
+  it("rests the asset on the third refusal, timed from that refusal",()=>{
+    // PAXG rebuilt a stop narrower than its own spread every 15 minutes and
+    // was refused every time, leaving a dead order row behind each attempt.
+    const rested=assetsInStructuralBackoff([refusal("paxg",0),refusal("paxg",0.25),refusal("paxg",0.5)],at(1));
+    expect(rested.get("paxg")).toEqual({until:at(6.5),count:3});
+  });
+
+  it("leaves an asset with fewer refusals alone",()=>{
+    expect(assetsInStructuralBackoff([refusal("paxg",0),refusal("paxg",0.25)],at(1)).size).toBe(0);
+  });
+
+  it("counts each asset separately",()=>{
+    const rested=assetsInStructuralBackoff([refusal("paxg",0),refusal("paxg",0.25),refusal("paxg",0.5),refusal("bnb",0.5)],at(1));
+    expect([...rested.keys()]).toEqual(["paxg"]);
+  });
+
+  it("keeps resting while refusals continue, and releases once they stop",()=>{
+    const run=[refusal("paxg",0),refusal("paxg",0.25),refusal("paxg",0.5)];
+    expect(assetsInStructuralBackoff(run,at(6.4)).size).toBe(1);
+    expect(assetsInStructuralBackoff(run,at(6.5)).size).toBe(0);
+    // A fourth refusal an hour later pushes the clock out from there.
+    expect(assetsInStructuralBackoff([...run,refusal("paxg",1.5)],at(7)).get("paxg")?.until).toBe(at(7.5));
+  });
+
+  it("is switched off by a zero limit and ignores unusable timestamps",()=>{
+    const run=[refusal("paxg",0),refusal("paxg",0.25),refusal("paxg",0.5)];
+    expect(assetsInStructuralBackoff(run,at(1),resolveRestingEntry({structuralRejectionLimit:0})).size).toBe(0);
+    expect(resolveRestingEntry({structuralRejectionLimit:0}).structuralRejectionLimit).toBe(0);
+    expect(assetsInStructuralBackoff([{assetId:"paxg",at:"not-a-date"},...run.slice(0,2)],at(1)).size).toBe(0);
   });
 });

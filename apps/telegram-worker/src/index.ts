@@ -2,7 +2,7 @@ import { fixedRules, getConfig } from "@huxtrade/config";
 import { claimRestartRequest, pool, query, recordHealth, transaction } from "@huxtrade/database";
 import {
   formatAssetResumed,formatClosed,formatEntryFilled,formatGeneric,formatMarginPauseResume,
-  formatBreakevenStopFailed,formatDirectionHalted,formatOrderCreated,formatOrderFailed,formatScaledOut,formatServiceRecovered,formatSessionLost,formatSignal,formatSystemError,
+  formatBreakevenStopFailed,formatDirectionHalted,formatOrderCreated,formatOrderDesynced,formatOrderFailed,formatScaledOut,formatServiceRecovered,formatSessionLost,formatSignal,formatSystemError,
   type FillRow,type OrderContext
 } from "./format.js";
 import {
@@ -33,6 +33,7 @@ async function format(topic:string,payload:Record<string,unknown>){
     case "closed_sl_or_liquidated":
     case "closed_reversed":{const order=await orderContext(payload.orderId);return order?formatClosed(String(payload.toState??""),order,await orderFills(payload.orderId)):formatGeneric(topic,payload);}
     case "direction_halted":return formatDirectionHalted(payload);
+    case "order_desynced":return formatOrderDesynced(payload,await orderContext(payload.orderId));
     case "scaled_out":return formatScaledOut(payload);
     case "breakeven_stop_failed":return formatBreakevenStopFailed(payload);
     case "system_error":return formatSystemError(payload);

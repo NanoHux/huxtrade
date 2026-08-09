@@ -82,6 +82,12 @@ export interface RestingEntrySettings {
   scaleOutMinStopPercent: number;
   /** How far beyond entry, in stop-widths, the surviving half's breakeven stop sits. */
   breakevenOffsetR: number;
+  /** The stop must be at least this many times the quoted bid/ask spread. 0 disables the check. */
+  minStopSpreadMultiple: number;
+  /** Consecutive structural submission rejections before an asset is rested. 0 disables the backoff. */
+  structuralRejectionLimit: number;
+  /** How long a rested asset stays out, in hours. */
+  structuralBackoffHours: number;
 }
 
 export interface Strategy {

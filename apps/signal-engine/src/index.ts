@@ -2,7 +2,7 @@ import { fixedRules, getConfig } from "@huxtrade/config";
 import { claimRestartRequest, pool, query, recordHealth, transaction } from "@huxtrade/database";
 import { BinanceFuturesClient,variationalUnderlying } from "@huxtrade/exchange-clients";
 import { atr, findAtrSwing } from "@huxtrade/indicators";
-import { candidateDirections, directionAllowed, directionAllowedAfterMove, evaluateConditions, haltedDirections, heatmapEntryState, makeOrderPlan, neutralBias, resolveRestingEntry, riskGate, type BiasState, type WorkingRestingOrder } from "@huxtrade/strategy-engine";
+import { candidateDirections, directionAllowed, directionAllowedAfterMove, assetsInStructuralBackoff, evaluateConditions, haltedDirections, heatmapEntryState, makeOrderPlan, neutralBias, resolveRestingEntry, riskGate, type BiasState, type WorkingRestingOrder } from "@huxtrade/strategy-engine";
 import type { ConditionResult, Direction, HeatmapRegion, OrderPlan, Strategy } from "@huxtrade/shared-types";
 import { decideRestingScan, restingOutboxMessage, type RestingAssetInput } from "./resting.js";
 import { timestampIso } from "./time.js";
@@ -148,6 +148,22 @@ async function run(){
            AND updated_at > now() - ($1||' hours')::interval`,[String(lookbackHours||1)])).rows
         .map((row)=>({direction:row.direction==="LONG"?"LONG" as const:"SHORT" as const,closedAt:new Date(row.closed_at).toISOString()}))
       :[];
+    // One /ticker/24hr for the whole board. Weight 40 against the zero the old
+    // derivation cost by riding on candles fetched for other reasons — this is
+    // a deliberate trade of budget for a figure that exists on day one.
+    const changes24h=await binance.all24hChangePercent().catch(()=>new Map<string,number>());
+    // Assets whose submissions keep being refused on their own structure. The
+    // window covers the backoff itself so a run that has already tripped keeps
+    // counting rather than ageing out mid-rest.
+    const structuralWindow=Math.max(strategy.restingEntry.structuralBackoffHours,0)||1;
+    const rejections=strategy.restingEntry.structuralRejectionLimit>0
+      ?(await query<{asset_id:string;occurred_at:string}>(
+        `SELECT asset_id,occurred_at::text FROM business_errors
+         WHERE code='ORDER_STRUCTURALLY_REJECTED' AND asset_id IS NOT NULL
+           AND occurred_at > now() - ($1||' hours')::interval`,[String(structuralWindow)])).rows
+        .map((row)=>({assetId:row.asset_id,at:new Date(row.occurred_at).toISOString()}))
+      :[];
+    const rested=assetsInStructuralBackoff(rejections,new Date().toISOString(),strategy.restingEntry);
     const halts=haltedDirections(recentLosses,new Date().toISOString(),strategy.restingEntry);
     const haltedBy=new Map(halts.map((halt)=>[halt.direction,halt]));
     await announceHalts(halts);
@@ -188,18 +204,13 @@ async function run(){
       let hourCandles:Awaited<ReturnType<typeof binance.klines>>|undefined;
       // Resolved lazily and only for a short that is otherwise ready to arm, so
       // the common case costs nothing; hourCandlesFor is cached per hour anyway.
-      let change24h:number|null|undefined;
-      const change24hFor=async()=>{
-        if(change24h!==undefined)return change24h;
-        try{
-          const candles=await hourCandlesFor(String(row.binance_symbol));
-          hourCandles=candles;
-          const settled=candles.filter((candle)=>candle.openTime+3_600_000<=new Date(String(row.closed_at)).getTime());
-          const previous=settled.at(-25),latest=settled.at(-1);
-          change24h=previous&&latest&&previous.close>0?(latest.close-previous.close)/previous.close*100:null;
-        }catch{change24h=null;}
-        return change24h;
-      };
+      // The venue's own rolling 24h figure. The previous derivation compared
+      // the 25th-last settled hourly close against the last, which needed a
+      // full day of candles and so returned nothing at all for a newly listed
+      // asset — and a null does not block, so the assets whose 24h move most
+      // needed judging were exactly the ones exempt from it.
+      const change24h=changes24h.get(String(row.binance_symbol))??null;
+      const change24hFor=async()=>change24h;
       const passedDirections:Direction[]=[];
       let restingConditions:ConditionResult[]=[];
       let restingRegions:HeatmapRegion[]=[];
@@ -289,8 +300,11 @@ async function run(){
         openPosition:positionByAsset.get(String(row.asset_id))??null,
         structurallyTradable:structural.passed&&Boolean(row.warmup_ready),
         structuralBlockers:[...(!row.warmup_ready?["INDICATOR_WARMUP"]:[]),...structural.reasons],
-        emitAllowed:emit.passed&&Boolean(row.warmup_ready)&&strategy.entryKind==="RESTING_LIMIT",
-        emitBlockers:[...emit.reasons,...(strategy.entryKind==="RESTING_LIMIT"?[]:["STRATEGY_USES_MARKET_ON_SIGNAL"])]
+        // Withheld from SUBMISSION only. The decision is still computed and
+        // written to the ledger, so a rested asset keeps producing evidence.
+        emitAllowed:emit.passed&&Boolean(row.warmup_ready)&&strategy.entryKind==="RESTING_LIMIT"&&!rested.has(String(row.asset_id)),
+        emitBlockers:[...emit.reasons,...(strategy.entryKind==="RESTING_LIMIT"?[]:["STRATEGY_USES_MARKET_ON_SIGNAL"]),
+          ...(rested.has(String(row.asset_id))?[`STRUCTURAL_BACKOFF: ${rested.get(String(row.asset_id))!.count} refusals; resumes ${rested.get(String(row.asset_id))!.until}`]:[])]
       });
       restingGroups.set(closedAt,group);
       const latestSignal=await query<{id:string}>("SELECT id FROM signals WHERE asset_id=$1 AND closed_at=$2 ORDER BY created_at DESC LIMIT 1",[row.asset_id,row.closed_at]);

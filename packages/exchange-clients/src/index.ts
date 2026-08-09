@@ -3,6 +3,15 @@ import type { Candle } from "@huxtrade/indicators";
 import type { HeatmapRegion } from "@huxtrade/shared-types";
 import { eligibleHeatmapRegions } from "@huxtrade/strategy-engine";
 
+const intervalUnitMs:Record<string,number>={m:60_000,h:3_600_000,d:86_400_000,w:604_800_000};
+/** Binance interval strings are a count and a unit: 5m, 1h, 1d, 1w. */
+export function intervalMs(interval:string){
+  const match=/^(\d+)([mhdw])$/.exec(interval);
+  const unit=match?intervalUnitMs[match[2]!]:undefined;
+  if(!match||!unit)throw new Error(`Unsupported Binance interval ${interval}`);
+  return Number(match[1])*unit;
+}
+
 async function json<T>(url: URL, init?: RequestInit): Promise<T> {
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), 12_000);
@@ -46,12 +55,39 @@ export class BinanceFuturesClient {
   async klinesRange(symbol:string,interval:string,startTime:number,endTime:number):Promise<Candle[]>{
     const result:Candle[]=[];let cursor=startTime;
     for(let page=0;page<100&&cursor<endTime;page+=1){
-      const data=await json<Array<[number,string,string,string,string,string,number,string,number,string,string]>>(this.url("/fapi/v1/klines",{symbol,interval,startTime:cursor,endTime,limit:1500}));
+      // Binance charges klines by requested limit, not by rows returned:
+      // 1 up to 100, 2 to 500, 5 to 1000, 10 beyond. Asking for a flat 1500
+      // made the three 5m candles of one scan window cost the same as a
+      // month of history — 460 of the ~614 weight the collector spent every
+      // 15 minutes, for 138 candles. Ask for what the range actually holds.
+      const limit=Math.min(1500,Math.max(1,Math.ceil((endTime-cursor)/intervalMs(interval))+1));
+      const data=await json<Array<[number,string,string,string,string,string,number,string,number,string,string]>>(this.url("/fapi/v1/klines",{symbol,interval,startTime:cursor,endTime,limit}));
       if(!data.length)break;
       const candles=this.mapKlines(data);result.push(...candles);
-      const next=candles.at(-1)!.openTime+1;if(data.length<1500||next<=cursor)break;cursor=next;
+      const next=candles.at(-1)!.openTime+1;if(data.length<limit||next<=cursor)break;cursor=next;
     }
     return result;
+  }
+
+  /**
+   * Every USDT-M perpetual's last price in one request. Weight 2 against the
+   * 1 each that 46 per-symbol calls would cost, and it cannot half-fail: one
+   * transient fetch used to pause whichever asset happened to be in flight.
+   */
+  async allPrices():Promise<Map<string,number>>{
+    const data=await json<Array<{symbol:string;price:string}>>(this.url("/fapi/v1/ticker/price",{}));
+    return new Map(data.map((row)=>[row.symbol,Number(row.price)] as const).filter(([,price])=>Number.isFinite(price)));
+  }
+
+  /**
+   * Rolling 24h change for every symbol, one request. Replaces deriving it
+   * from 25 hourly closes, which needed a full day of candle history and so
+   * returned nothing at all for a newly listed asset — exactly the assets the
+   * extreme-move filter most needs to judge.
+   */
+  async all24hChangePercent():Promise<Map<string,number>>{
+    const data=await json<Array<{symbol:string;priceChangePercent:string}>>(this.url("/fapi/v1/ticker/24hr",{}));
+    return new Map(data.map((row)=>[row.symbol,Number(row.priceChangePercent)] as const).filter(([,change])=>Number.isFinite(change)));
   }
   async openInterest(symbol: string) {
     const data = await json<{ openInterest: string; time: number }>(this.url("/fapi/v1/openInterest", { symbol }));

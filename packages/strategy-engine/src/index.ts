@@ -202,14 +202,15 @@ export function resolveRestingEntry(overrides?:Partial<RestingEntrySettings>|nul
   // positive-only merge above would have silently ignored it.
   // 0 is meaningful for each of these — it switches the rule off — so the
   // positive-only merge above would silently restore the default instead.
-  for(const key of ["extremeMoveBlockPercent","lossStreakCount"] as const){
+  for(const key of ["extremeMoveBlockPercent","lossStreakCount","structuralRejectionLimit"] as const){
     const value=overrides?.[key];
     if(typeof value==="number"&&Number.isFinite(value)&&value>=0)resolved[key]=value;
   }
   resolved.lossStreakCount=Math.max(0,Math.round(resolved.lossStreakCount));
+  resolved.structuralRejectionLimit=Math.max(0,Math.round(resolved.structuralRejectionLimit));
   // Same reasoning: 0 disables scaling out entirely, which the positive-only
   // merge would read as "unset" and quietly restore the default.
-  for(const key of ["scaleOutTriggerR","scaleOutFraction","scaleOutMinStopPercent","breakevenOffsetR"] as const){
+  for(const key of ["scaleOutTriggerR","scaleOutFraction","scaleOutMinStopPercent","breakevenOffsetR","minStopSpreadMultiple"] as const){
     const value=overrides?.[key];
     if(typeof value==="number"&&Number.isFinite(value)&&value>=0)resolved[key]=value;
   }
@@ -266,6 +267,50 @@ export function haltedDirections(losses:DirectionLoss[],now:string,settings:Rest
     if(until>nowMs)halts.push({direction,until:new Date(until).toISOString(),count});
   }
   return halts;
+}
+
+/** A submission refused for a reason the same structure will reproduce. */
+export interface StructuralRejection{assetId:string;at:string}
+
+/**
+ * Assets rested after repeated structural rejections.
+ *
+ * A structural refusal is not a failure to retry — it is the same plan being
+ * rebuilt and refused on its own merits. PAXG produced a stop narrower than
+ * its own spread every 15 minutes, and each attempt cost a submission and left
+ * a dead order row behind. Resting the asset stops the churn without touching
+ * anything already working: the backoff withholds SUBMISSION, so the ledger
+ * still records what the model would have done.
+ *
+ * Transient venue refusals (a skew limit that clears itself) and network
+ * failures must never be counted here — those are exactly the cases where
+ * retrying is the correct behaviour.
+ *
+ * Timed from the qualifying rejection rather than from now, so a restart can
+ * neither extend nor reset it.
+ */
+export function assetsInStructuralBackoff(rejections:StructuralRejection[],now:string,settings:RestingEntrySettings=restingEntryDefaults):Map<string,{until:string;count:number}>{
+  const limit=Math.round(settings.structuralRejectionLimit);
+  const rested=new Map<string,{until:string;count:number}>();
+  if(!(limit>0)||!(settings.structuralBackoffHours>0))return rested;
+  const nowMs=new Date(now).getTime();
+  if(!Number.isFinite(nowMs))return rested;
+  const backoffMs=settings.structuralBackoffHours*3_600_000;
+  const byAsset=new Map<string,number[]>();
+  for(const rejection of rejections){
+    const at=new Date(rejection.at).getTime();
+    if(!Number.isFinite(at))continue;
+    byAsset.set(rejection.assetId,[...(byAsset.get(rejection.assetId)??[]),at]);
+  }
+  for(const [assetId,times] of byAsset){
+    if(times.length<limit)continue;
+    // The newest qualifying rejection sets the clock, so a run that has kept
+    // going keeps the asset rested rather than letting the first one expire.
+    const trippedAt=[...times].sort((a,b)=>a-b).at(-1)!;
+    const until=trippedAt+backoffMs;
+    if(until>nowMs)rested.set(assetId,{until:new Date(until).toISOString(),count:times.length});
+  }
+  return rested;
 }
 
 export type ScaleOutAction="SCALE_OUT"|"NONE";
@@ -374,6 +419,26 @@ export function classifyExitByPrice(input:{
   // not something to guess a winner from.
   if(hitStop===hitTarget)return null;
   return hitTarget?"CLOSED_TP":"CLOSED_SL";
+}
+
+/**
+ * Whether a stop is wide enough to be worth putting on the wire.
+ *
+ * Measured against the venue's own quoted spread rather than as a share of
+ * price. The narrowest stops that have traded fine are BTC at 0.21% and DOGE
+ * at 0.27% of price, because their spreads are negligible; PAXG's 0.064% stop
+ * was refused on exactly the same rule because its spread was 0.059% — the
+ * position would have been most of the way to its stop the moment it filled.
+ * A percentage floor set high enough to catch PAXG would have thrown away BTC.
+ *
+ * An unusable or zero spread does not block: a missing quote is ignorance, and
+ * the venue's own minimums still apply underneath this.
+ */
+export function stopClearsSpread(stopDistance:number,spread:number,settings:RestingEntrySettings=restingEntryDefaults):boolean{
+  if(!(settings.minStopSpreadMultiple>0))return true;
+  if(!Number.isFinite(spread)||spread<=0)return true;
+  if(!Number.isFinite(stopDistance)||stopDistance<=0)return false;
+  return stopDistance>=spread*settings.minStopSpreadMultiple;
 }
 
 export function breakevenThroughMarket(direction:Direction,breakeven:number,markPrice:number):boolean{

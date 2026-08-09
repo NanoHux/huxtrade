@@ -1,5 +1,6 @@
 import { describe,expect,it } from "vitest";
 import type { OrderPlan } from "@huxtrade/shared-types";
+import { adjustMarginForPlatformMinimum } from "@huxtrade/strategy-engine";
 import { OmniBrowserAdapter,priceDecimalsFromQuote,quantizePlanPrices,type OmniTransport } from "./omni-adapter.js";
 
 // risk 800, reward 1200 => exactly the 1.5 floor from spec 8.3.
@@ -158,7 +159,15 @@ describe("Variational Omni browser-context adapter",()=>{
       throw new Error(`unexpected ${path}`);
     });
     const adapter=new OmniBrowserAdapter(transport,config);
-    expect(await adapter.minimumMargin(plan)).toBeCloseTo(0.0256);
+    // Nothing was raised, so the margin the venue will consume is the margin
+    // the plan asked for. (This used to report min_qty x price / leverage —
+    // 0.0256 — which answers a different question and is why an order raised
+    // to the venue floor passed the cap check unnoticed.)
+    // Quantization only ever rounds the quantity DOWN, so the requirement
+    // lands just under the planned margin, never above it.
+    const required=await adapter.minimumMargin(plan);
+    expect(required).toBeLessThanOrEqual(plan.marginUsdc);
+    expect(required).toBeGreaterThan(plan.marginUsdc-0.01);
     const entry=await adapter.submitEntry(plan as unknown as Record<string,unknown>);
     await expect(adapter.placeTakeProfit(entry,plan)).resolves.toMatchObject({id:"tp-1"});
     await expect(adapter.placeStopLoss(entry,plan)).resolves.toMatchObject({id:"sl-1"});
@@ -443,5 +452,67 @@ describe("attributing an exit when the venue's rfq trail is gone",()=>{
   it("falls back to the rfq trail when no local levels were supplied",async()=>{
     const tracked=await new OmniBrowserAdapter(transport(),config).listTracked([{id:"entry-zro"}]);
     expect(tracked[0]).toMatchObject({state:"CLOSED_REVERSED"});
+  });
+});
+
+describe("an order the venue will not accept at the planned size",()=>{
+  // Variational enforces a minimum quantity, and prepare() silently raises a
+  // sub-minimum order to it. ON was planned at 100 USDC of margin, submitted
+  // at the venue's 1500 USDC minimum notional — 3x the intended risk — and
+  // recorded as 100, because the guard read min_qty back off the RE-QUOTE
+  // issued after the raise and saw nothing wrong.
+  const bigMinimum={quote_id:"quote-1",bid:"64000",ask:"64001",
+    qty_limits:{bid:{min_qty_tick:"0.001",min_qty:"0.05",max_qty:"10"},ask:{min_qty_tick:"0.001",min_qty:"0.05",max_qty:"10"}}};
+
+  it("reports the margin the raised size will really consume",async()=>{
+    const transport=new FakeTransport((path)=>{
+      if(path.includes("/settlement_pools/leverage"))return {BTC:{current:"5",limits:[]}};
+      if(path.includes("/quotes/indicative"))return bigMinimum;
+      throw new Error(`unexpected ${path}`);
+    });
+    // Planned 50 USDC of notional = 0.00078 BTC, under the 0.05 floor, so the
+    // submission becomes 0.051 BTC — 3264 USDC of notional, 652 of margin.
+    const required=await new OmniBrowserAdapter(transport,config).minimumMargin(plan);
+    expect(required).toBeCloseTo(0.051*64000/5,3);
+    // Which is what lets the caller's cap actually bite.
+    expect(adjustMarginForPlatformMinimum(plan.marginUsdc,required,500,5).accepted).toBe(false);
+  });
+});
+
+describe("an order that left the venue in two pieces",()=>{
+  // ON: entry 4210.5 short, half closed by the scale-out, the rest by the
+  // breakeven stop. No single trade is as large as the entry, so the old
+  // "one exit at least the entry size" match found nothing and reported a
+  // fully closed, profitable order as a vanished position.
+  const instrument={instrument_type:"perpetual_future",underlying:"ON",funding_interval_s:3600,settlement_asset:"USDC"};
+  const entryTrade={id:"t0",source_rfq:"entry-on",instrument,side:"sell",qty:"4210.5",price:"0.3564",created_at:"2026-08-09T08:05:14Z",mark_price:"0.3564"};
+  const scaleOut={id:"t1",source_rfq:"scale-rfq",instrument,side:"buy",qty:"2105.2",price:"0.3530",created_at:"2026-08-09T08:08:11Z",mark_price:"0.3530"};
+  const stopOut={id:"t2",source_rfq:"be-rfq",instrument,side:"buy",qty:"2105.3",price:"0.3559",created_at:"2026-08-09T08:20:00Z",mark_price:"0.3558"};
+  const levels={id:"entry-on",direction:"SHORT" as const,entryPrice:0.3563,stopLoss:0.3660,takeProfit:0.3175,breakevenStop:0.355815};
+  const feed=(trades:unknown[],positions:unknown[]=[])=>new FakeTransport((path)=>{
+    if(path.includes("status=pending"))return page([]);
+    if(path.includes("/orders/v2"))return page([]);
+    if(path==="/api/positions")return positions;
+    if(path.includes("/trades"))return page(trades);
+    if(path.includes("/transfers"))return page([]);
+    throw new Error(`unexpected ${path}`);
+  });
+
+  it("adds the pieces up and books the breakeven stop that finished it",async()=>{
+    const tracked=await new OmniBrowserAdapter(feed([stopOut,scaleOut,entryTrade]),config).listTracked([levels]);
+    expect(tracked[0]).toMatchObject({id:"entry-on",state:"CLOSED_SL"});
+  });
+
+  it("still reports FILLED_OPEN while the surviving half is open",async()=>{
+    const position={position_info:{company:"c",pool_location:"p",instrument,qty:"-2105.3",avg_entry_price:"0.3564",opened_at:"2026-08-09T08:05:14Z"},price_info:{price:"0.3558"},upnl:"1",rpnl:"7.15"};
+    const tracked=await new OmniBrowserAdapter(feed([scaleOut,entryTrade],[position]),config).listTracked([levels]);
+    expect(tracked[0]).toMatchObject({state:"FILLED_OPEN"});
+  });
+
+  it("does not call it closed while the pieces still fall short of the entry",async()=>{
+    // Only the scale-out has printed and the position is momentarily absent:
+    // that is a settling partial close, not an exit.
+    const tracked=await new OmniBrowserAdapter(feed([scaleOut,entryTrade]),config).listTracked([levels]);
+    expect(tracked[0]).toMatchObject({state:"UNKNOWN"});
   });
 });

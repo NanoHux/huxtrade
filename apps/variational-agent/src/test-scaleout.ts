@@ -117,3 +117,9 @@ if(command==="movestop"){
 }
 
 await transport.close?.();
+
+// Playwright keeps the CDP connection alive after close(), so the event loop
+// never empties and the process lingers holding a handle on the same Chrome
+// page the agent drives. Two clients on one page deadlock, so leaving these
+// behind is a hazard, not just untidiness.
+process.exit(0);

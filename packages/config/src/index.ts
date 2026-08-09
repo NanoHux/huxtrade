@@ -41,7 +41,7 @@ const schema = z.object({
   COINGLASS_BROWSER_EXECUTABLE: z.string().default(""),
   COINGLASS_CDP_URL: z.string().default(""),
   COINGLASS_AGENT_POLL_MS: z.coerce.number().int().min(5_000).default(15_000),
-  COINGLASS_REFRESH_MS: z.coerce.number().int().min(60_000).default(10*60_000),
+  COINGLASS_REFRESH_MS: z.coerce.number().int().min(60_000).default(15*60_000),
   COINGLASS_CAPTURE_DELAY_MS: z.coerce.number().int().min(0).default(2_000),
   VARIATIONAL_BASE_URL: z.string().default(""),
   VARIATIONAL_PROFILE_PATH: z.string().default("./playwright-profile"),
@@ -235,7 +235,30 @@ export const fixedRules = Object.freeze({
     // The breakeven stop is set this fraction of a stop-width *beyond* entry,
     // in the position's favour, so the exit still clears the spread rather
     // than scratching at exactly the entry price and paying to get out.
-    breakevenOffsetR: 0.05
+    breakevenOffsetR: 0.05,
+    // The stop must clear the quoted spread by this multiple or the order is
+    // not worth submitting. Measured against the SPREAD, not as a percentage
+    // of price: PAXG's 0.062% stop was only 1.08x its own 0.057% spread, so
+    // the position would have been most of the way to its stop the moment it
+    // filled, while BTC trades fine on a 0.21% stop because its spread is
+    // small. No flat percentage floor separates those two.
+    //
+    // 4, not the 8 this first shipped with. 8 was reasoned from Binance
+    // order-book spreads; Variational quotes RFQ and its majors sit at 5-7
+    // basis points, which would have refused roughly a fifth of all plans —
+    // and refused them hardest on the low-volatility majors the rule was
+    // never aimed at. At 4x one round trip costs a quarter of the stop, which
+    // is already expensive; the number is provisional until enough rejections
+    // have logged real spreads to set it from the distribution rather than
+    // from an analogy.
+    minStopSpreadMultiple: 4,
+    // Structural rejections repeat: PAXG rebuilt the same sub-spread stop and
+    // was refused every 15 minutes, leaving a dead order row each time. After
+    // this many in a row the asset stops being offered for submission for
+    // `structuralBackoffHours`. Transient venue refusals (skew limits) and
+    // network failures are deliberately excluded — those clear on their own.
+    structuralRejectionLimit: 3,
+    structuralBackoffHours: 6
   }),
   // Whitelist size. Every asset costs one CoinGlass heatmap capture and one
   // Binance round trip per 15-minute scan, which is the real constraint — the

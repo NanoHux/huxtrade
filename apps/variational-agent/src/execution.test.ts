@@ -72,11 +72,14 @@ describe("Variational initial protection compensation",()=>{
     expect(notificationTopicsForTransition("FILLED_OPEN","CLOSED_TP")).toEqual(["notification.closed_tp"]);
     expect(notificationTopicsForTransition("FILLED_OPEN","LIQUIDATED")).toEqual(["notification.closed_sl_or_liquidated"]);
     expect(notificationTopicsForTransition("FILLED_OPEN","CLOSED_REVERSED")).toEqual(["notification.closed_reversed"]);
-    expect(notificationTopicsForTransition("UNKNOWN","RECONCILIATION_REQUIRED")).toEqual(["notification.order_failed"]);
+    // Bookkeeping drift, not a failed submission: the order reached the venue
+    // and may still hold a protected position, so it must not read as "下单失败".
+    expect(notificationTopicsForTransition("UNKNOWN","RECONCILIATION_REQUIRED")).toEqual(["notification.order_desynced"]);
+    expect(notificationTopicsForTransition("FILLED_OPEN","UNKNOWN")).toEqual(["notification.order_desynced"]);
     expect(notificationTopicsForTransition("CREATED_LOCAL","SUBMITTING")).toEqual([]);
     // A replaced resting order is the model working, not a failure.
     expect(notificationTopicsForTransition("PENDING_ENTRY","CANCELLED_REPLACED")).toEqual(["notification.resting_order_replaced"]);
-    expect(notificationTopicsForTransition("PENDING_ENTRY","CANCELLED_EXTERNALLY")).toEqual(["notification.order_failed"]);
+    expect(notificationTopicsForTransition("PENDING_ENTRY","CANCELLED_EXTERNALLY")).toEqual(["notification.order_desynced"]);
     // A venue limit is refused, unactionable and self-resolving, and retried
     // every scan — it must be mutable without silencing real failures.
     expect(notificationTopicsForTransition("SUBMITTING","SUBMISSION_FAILED","VENUE_LIMIT")).toEqual(["notification.venue_limit_rejected"]);

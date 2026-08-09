@@ -25,6 +25,17 @@ function withTimeout<T>(promise:Promise<T>,ms:number,label:string):Promise<T>{
   });
 }
 
+/**
+ * How long a page-script read may take before it is abandoned.
+ *
+ * 20s, not the 10s this was written with: that figure was set when the
+ * whitelist held 28 assets, and at 46 the sweep runs 2m52s of back-to-back
+ * WebGL heatmaps. Three captures a day were timing out purely from load —
+ * and a timeout is not harmless, because the stale heatmap it leaves behind
+ * pauses the asset on the next collector scan and cancels its working order.
+ */
+const captureReadTimeoutMs=20_000;
+
 const looksLikeCrash=(error:unknown)=>/crash|target closed|session closed/i.test(error instanceof Error?error.message:String(error));
 
 export class CoinGlassBrowserClient{
@@ -93,12 +104,22 @@ export class CoinGlassBrowserClient{
     try{
       return await this.captureOnce(sourceUrl,range);
     }catch(error){
-      if(!this.pageCrashed&&!looksLikeCrash(error))throw error;
-      // One retry on a fresh page: a crashed renderer doesn't recover on its
-      // own, so without this the agent would fail every capture until someone
-      // notices and restarts the whole process.
+      // One retry on a fresh page, for ANY failure rather than only for a
+      // crash. The old predicate matched "crash|target closed|session closed",
+      // so a read that merely timed out was reported as a hard failure and
+      // skipped — which is what took ZRO's heatmap stale and then paused the
+      // asset. A crashed renderer never recovers on its own, and a page that
+      // timed out under load is exactly the case a reload fixes; neither is
+      // worth distinguishing when the response to both is the same.
+      const crashed=this.pageCrashed||looksLikeCrash(error);
       await this.recreatePage();
-      return await this.captureOnce(sourceUrl,range);
+      try{
+        return await this.captureOnce(sourceUrl,range);
+      }catch(retryError){
+        // Surfaced with both attempts named, so the log says whether this was
+        // a renderer that died or a page that was simply too slow twice.
+        throw new Error(`${retryError instanceof Error?retryError.message:String(retryError)} (retried after ${crashed?"a crashed page":"a failed capture"})`);
+      }
     }
   }
 
@@ -113,12 +134,12 @@ export class CoinGlassBrowserClient{
       // query param, so a non-default range must be picked from the UI.
       const trigger=this.page.getByRole("combobox").filter({hasText:/^(12 hour|24 hour|48 hour|3 day|1 week|2 week|1 month|3 month|6 month|1 Year|2 Year)$/});
       await trigger.first().click({timeout:15_000});
-      await withTimeout(this.page.evaluate(()=>{(window as unknown as CaptureFlag).__cgCapture=undefined;}),10_000,"CoinGlass capture-flag reset");
+      await withTimeout(this.page.evaluate(()=>{(window as unknown as CaptureFlag).__cgCapture=undefined;}),captureReadTimeoutMs,"CoinGlass capture-flag reset");
       await this.page.getByRole("option",{name:rangeOptionLabel[range],exact:true}).click({timeout:15_000});
     }
     const capturedAtMs=Date.now();
     await this.page.waitForFunction(()=>(window as unknown as CaptureFlag).__cgCapture!==undefined,null,{timeout:30_000});
-    const data=await withTimeout(this.page.evaluate(()=>(window as unknown as CaptureFlag).__cgCapture),10_000,"CoinGlass capture-data read") as DecodedHeatmap;
+    const data=await withTimeout(this.page.evaluate(()=>(window as unknown as CaptureFlag).__cgCapture),captureReadTimeoutMs,"CoinGlass capture-data read") as DecodedHeatmap;
     const payload:CoinGlassWebHeatmapPayload={code:"0",data:data as NonNullable<CoinGlassWebHeatmapPayload["data"]>};
     const normalized=normalizeCoinGlassWebHeatmap(payload);
     return {...normalized,sourceUrl:buildCoinGlassHeatmapPageUrl(parsed.url,range),capturedAt:new Date(capturedAtMs)};
