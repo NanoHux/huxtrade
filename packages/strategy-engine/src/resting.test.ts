@@ -460,40 +460,44 @@ describe("refusing to trade with a move that has already run",()=>{
 describe("halting a direction after a run of losses",()=>{
   const at=(hours:number)=>new Date(Date.UTC(2026,7,9,0,0,0)+hours*3_600_000).toISOString();
   const loss=(direction:"LONG"|"SHORT",hours:number)=>({direction,closedAt:at(hours)});
+  // Pinned at three so these assert the counting mechanism rather than the
+  // shipped threshold, which moved to four after the first live trigger fired
+  // on three small, fast losses.
+  const afterThree=resolveRestingEntry({lossStreakCount:3});
 
   it("halts the direction on the third loss inside the window",()=>{
-    const halts=haltedDirections([loss("SHORT",0),loss("SHORT",1),loss("SHORT",2)],at(3));
+    const halts=haltedDirections([loss("SHORT",0),loss("SHORT",1),loss("SHORT",2)],at(3),afterThree);
     // The halt runs from the qualifying loss, not from now, so a restart can
     // neither extend nor reset it.
     expect(halts).toEqual([{direction:"SHORT",until:at(14),count:3}]);
   });
 
   it("leaves the other direction free to trade",()=>{
-    const halts=haltedDirections([loss("SHORT",0),loss("SHORT",1),loss("SHORT",2)],at(3));
+    const halts=haltedDirections([loss("SHORT",0),loss("SHORT",1),loss("SHORT",2)],at(3),afterThree);
     expect(halts.some((halt)=>halt.direction==="LONG")).toBe(false);
   });
 
   it("does not fire on two losses, or on three spread beyond the window",()=>{
-    expect(haltedDirections([loss("SHORT",0),loss("SHORT",1)],at(2))).toEqual([]);
+    expect(haltedDirections([loss("SHORT",0),loss("SHORT",1)],at(2),afterThree)).toEqual([]);
     // 0, 5 and 7 hours: no three of them sit inside a 6-hour window.
-    expect(haltedDirections([loss("SHORT",0),loss("SHORT",5),loss("SHORT",7)],at(8))).toEqual([]);
+    expect(haltedDirections([loss("SHORT",0),loss("SHORT",5),loss("SHORT",7)],at(8),afterThree)).toEqual([]);
   });
 
   it("counts a mixed streak per direction, not in total",()=>{
     // Three losses, but only two of them one way.
-    expect(haltedDirections([loss("SHORT",0),loss("LONG",1),loss("SHORT",2)],at(3))).toEqual([]);
+    expect(haltedDirections([loss("SHORT",0),loss("LONG",1),loss("SHORT",2)],at(3),afterThree)).toEqual([]);
   });
 
   it("expires the halt once the configured hours have passed",()=>{
     const streak=[loss("SHORT",0),loss("SHORT",1),loss("SHORT",2)];
-    expect(haltedDirections(streak,at(13.9))).toHaveLength(1);
-    expect(haltedDirections(streak,at(14))).toEqual([]);
+    expect(haltedDirections(streak,at(13.9),afterThree)).toHaveLength(1);
+    expect(haltedDirections(streak,at(14),afterThree)).toEqual([]);
   });
 
   it("re-arms the halt from the newest qualifying window",()=>{
     // A fourth loss at hour 4 completes a fresher 2..4 window, so the halt
     // runs from there rather than from the original third loss.
-    const halts=haltedDirections([loss("SHORT",0),loss("SHORT",1),loss("SHORT",2),loss("SHORT",4)],at(5));
+    const halts=haltedDirections([loss("SHORT",0),loss("SHORT",1),loss("SHORT",2),loss("SHORT",4)],at(5),afterThree);
     expect(halts[0]).toMatchObject({direction:"SHORT",until:at(16)});
   });
 
@@ -501,7 +505,7 @@ describe("halting a direction after a run of losses",()=>{
     const halts=haltedDirections([
       loss("SHORT",0),loss("SHORT",1),loss("SHORT",2),
       loss("LONG",1),loss("LONG",2),loss("LONG",3)
-    ],at(4));
+    ],at(4),afterThree);
     expect(halts.map((halt)=>halt.direction).sort()).toEqual(["LONG","SHORT"]);
   });
 
@@ -509,7 +513,7 @@ describe("halting a direction after a run of losses",()=>{
     const streak=[loss("SHORT",0),loss("SHORT",1),loss("SHORT",2)];
     expect(haltedDirections(streak,at(3),resolveRestingEntry({lossStreakCount:0}))).toEqual([]);
     expect(resolveRestingEntry({lossStreakCount:0}).lossStreakCount).toBe(0);
-    expect(haltedDirections([{direction:"SHORT",closedAt:"not-a-date"},...streak.slice(0,2)],at(3))).toEqual([]);
+    expect(haltedDirections([{direction:"SHORT",closedAt:"not-a-date"},...streak.slice(0,2)],at(3),afterThree)).toEqual([]);
   });
 });
 
@@ -535,11 +539,21 @@ describe("scaling out of an open position",()=>{
     expect(scaleOutDecision({...short,markPrice:101}).profitR).toBeCloseTo(-0.5,10);
   });
 
-  it("skips a stop too narrow for the spread the close would pay",()=>{
-    // 0.3% stop, far under the 0.8% floor, and deep in profit: still refused.
+  it("scales out at any stop width now the entry gate guarantees the spread",()=>{
+    // A 0.3% stop used to be refused here. minStopSpreadMultiple already
+    // refuses any entry whose stop is under 4x the quoted spread, so 0.5R is
+    // never less than two spreads and the width test was refusing trades it
+    // had no reason to. ENA ran 1.65R on a 0.65% stop, was skipped, and gave
+    // all of it back.
     const narrow={direction:"LONG" as const,entryPrice:100,stopLoss:99.7,markPrice:101,alreadyScaledOut:false};
-    expect(scaleOutDecision(narrow)).toMatchObject({action:"NONE"});
-    expect(scaleOutDecision(narrow).reason).toMatch(/under 0\.8%/);
+    expect(scaleOutDecision(narrow).action).toBe("SCALE_OUT");
+  });
+
+  it("still honours an explicit width floor when one is configured",()=>{
+    const narrow={direction:"LONG" as const,entryPrice:100,stopLoss:99.7,markPrice:101,alreadyScaledOut:false};
+    const gated=resolveRestingEntry({scaleOutMinStopPercent:0.8});
+    expect(scaleOutDecision(narrow,gated)).toMatchObject({action:"NONE"});
+    expect(scaleOutDecision(narrow,gated).reason).toMatch(/under 0\.8%/);
   });
 
   it("refuses to measure profit when the stop is on the wrong side of the entry",()=>{

@@ -208,12 +208,15 @@ export const fixedRules = Object.freeze({
     extremeMoveBlockPercent: 15,
     // Same-direction circuit breaker. Three stop-outs one way inside a few
     // hours is the signature of a regime the model is reading backwards, not
-    // of three independent unlucky trades: on 2026-08-08 four shorts stopped
-    // out between 18:58 and 22:14 for -157 USDC, and halting after the third
-    // would have prevented the last of them. Halting only stops that
+    // of independent unlucky trades: on 2026-08-08 four shorts stopped out
+    // between 18:58 and 22:14 for -157 USDC. Raised from three after the first
+    // real trigger fired on three longs worth -7.76 in six minutes — small,
+    // fast losses on tight stops are not the regime failure this is for, and
+    // halting a direction for twelve hours over them costs more in missed
+    // trades than it saves. Halting only stops that
     // direction ARMING; positions keep their own stop and target, and working
     // orders drain naturally as their bias expires.
-    lossStreakCount: 3,
+    lossStreakCount: 4,
     lossStreakWindowHours: 6,
     lossStreakHaltHours: 12,
     // Scale-out. Of 67 resolved trades in the 2026-08-07..09 replay, 61%
@@ -232,11 +235,21 @@ export const fixedRules = Object.freeze({
     // (72%) rather than as the peak of a curve fitted to 67 samples.
     scaleOutTriggerR: 0.5,
     scaleOutFraction: 0.5,
-    // Below this stop width the scale-out is skipped entirely. TRUMP's stop
-    // was 0.41% of price, which puts 0.5R at 0.2% — the spread paid to close
-    // half at market on an RFQ venue eats a large share of that, so the
-    // round trip stops being worth its own execution cost.
-    scaleOutMinStopPercent: 0.8,
+    // 0 — the scale-out runs whatever the stop width is.
+    //
+    // This shipped at 0.8%, reasoning that on a 0.41% stop the 0.5R trigger is
+    // only 0.2% of price and the spread paid to close half would eat most of
+    // it. The arithmetic was right and the conclusion was wrong, because
+    // minStopSpreadMultiple already refuses any entry whose stop is under 4x
+    // the quoted spread: 0.5R is therefore never less than two spreads, and
+    // banking a quarter of R while paying one spread on half the position is
+    // net positive at any width the entry gate lets through.
+    //
+    // What the gate actually cost is measurable. ENA ran 1.65R in favour on a
+    // 0.65% stop, was skipped for being under the bar, gave all of it back and
+    // closed at -1R; scaling out would have banked roughly +0.25R and left the
+    // rest on a breakeven stop.
+    scaleOutMinStopPercent: 0,
     // The breakeven stop is set this fraction of a stop-width *beyond* entry,
     // in the position's favour, so the exit still clears the spread rather
     // than scratching at exactly the entry price and paying to get out.

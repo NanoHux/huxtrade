@@ -801,7 +801,13 @@ export const validOrderTransitions: Record<string, string[]> = {
   // CANCELLED_REPLACED is terminal and distinct from CANCELLED_EXTERNALLY: the
   // resting model cancels its own working orders on purpose every time the
   // structure moves, and those must not read as platform-side failures.
-  PENDING_ENTRY: ["FILLED_OPEN", "CANCELLED_EXTERNALLY", "CANCELLED_REPLACED", "CLOSED_REVERSED", "UNKNOWN", "RECONCILIATION_REQUIRED"],
+  // The three closing states are reachable directly because a fill and its
+  // exit can both land inside one 30-second reconciliation window: ETH filled
+  // at 06:45:46 and stopped at 06:46:11. Without them the sweep could not
+  // apply what it had seen, dropped the order into RECONCILIATION_REQUIRED and
+  // resolved it a cycle later — correct in the end, but it raised a
+  // desync alarm on an order that had simply moved fast.
+  PENDING_ENTRY: ["FILLED_OPEN", "CLOSED_TP", "CLOSED_SL", "LIQUIDATED", "CANCELLED_EXTERNALLY", "CANCELLED_REPLACED", "CLOSED_REVERSED", "UNKNOWN", "RECONCILIATION_REQUIRED"],
   FILLED_OPEN: ["CLOSED_TP", "CLOSED_SL", "LIQUIDATED", "CLOSED_REVERSED", "RECONCILIATION_REQUIRED"],
   UNKNOWN: ["PENDING_ENTRY", "FILLED_OPEN", "CLOSED_TP", "CLOSED_SL", "LIQUIDATED", "CLOSED_REVERSED", "CANCELLED_EXTERNALLY", "SUBMISSION_FAILED", "RECONCILIATION_REQUIRED"],
   RECONCILIATION_REQUIRED: ["PENDING_ENTRY", "FILLED_OPEN", "CLOSED_TP", "CLOSED_SL", "LIQUIDATED", "CLOSED_REVERSED", "CANCELLED_EXTERNALLY", "UNKNOWN"]
