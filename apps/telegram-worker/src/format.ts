@@ -144,6 +144,11 @@ export function formatOrderDesynced(payload:Record<string,unknown>,order?:OrderC
   ].join("\n");
 }
 
+/** A free-text answer to a /cc question. Sent verbatim — it is prose, not a template. */
+export function formatOperatorReply(payload:Record<string,unknown>){
+  return String(payload.answer??"").trim()||"（没有内容）";
+}
+
 export function formatDirectionHalted(payload:Record<string,unknown>){
   const until=payload.until?new Date(String(payload.until)).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false}):"—";
   return [

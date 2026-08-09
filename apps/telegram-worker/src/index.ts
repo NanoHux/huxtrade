@@ -2,7 +2,7 @@ import { fixedRules, getConfig } from "@huxtrade/config";
 import { claimRestartRequest, pool, query, recordHealth, transaction } from "@huxtrade/database";
 import {
   formatAssetResumed,formatClosed,formatEntryFilled,formatGeneric,formatMarginPauseResume,
-  formatBreakevenStopFailed,formatDirectionHalted,formatOrderCreated,formatOrderDesynced,formatOrderFailed,formatScaledOut,formatServiceRecovered,formatSessionLost,formatSignal,formatSystemError,
+  formatBreakevenStopFailed,formatDirectionHalted,formatOperatorReply,formatOrderCreated,formatOrderDesynced,formatOrderFailed,formatScaledOut,formatServiceRecovered,formatSessionLost,formatSignal,formatSystemError,
   type FillRow,type OrderContext
 } from "./format.js";
 import {
@@ -32,6 +32,7 @@ async function format(topic:string,payload:Record<string,unknown>){
     case "closed_tp":
     case "closed_sl_or_liquidated":
     case "closed_reversed":{const order=await orderContext(payload.orderId);return order?formatClosed(String(payload.toState??""),order,await orderFills(payload.orderId)):formatGeneric(topic,payload);}
+    case "operator_reply":return formatOperatorReply(payload);
     case "direction_halted":return formatDirectionHalted(payload);
     case "order_desynced":return formatOrderDesynced(payload,await orderContext(payload.orderId));
     case "scaled_out":return formatScaledOut(payload);
@@ -182,7 +183,20 @@ async function pollCommands(){
     // Silence, not an error reply: answering an unknown chat confirms the bot
     // is live to whoever is probing it.
     if(chatId!==String(config.TELEGRAM_CHAT_ID))continue;
-    const command=parseCommand(update.message?.text);
+    const text=(update.message?.text??"").trim();
+    // Anything addressed to the assistant is parked rather than answered here:
+    // Telegram's getUpdates advances a shared offset, so a second poller would
+    // make messages invisible to this one. The reply comes back out through
+    // the same outbox as every other notification.
+    const addressed=/^\/cc(@\S+)?(\s|$)/i.exec(text);
+    if(addressed){
+      const question=text.slice(addressed[0].length).trim();
+      if(!question){await send("用法：/cc 后面直接跟你想问的内容");continue;}
+      await query("INSERT INTO operator_messages(chat_id,text) VALUES($1,$2)",[chatId,question]);
+      await send("已收到，正在查…");
+      continue;
+    }
+    const command=parseCommand(text);
     if(command)await send(await answer(command));
   }
   await query(`INSERT INTO app_state(key,value) VALUES('telegram_update_offset',$1)

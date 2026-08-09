@@ -35,7 +35,10 @@ const age=(minutes:number)=>minutes<60?`${Math.round(minutes)}分`:`${(minutes/6
 const clock=(value:string|null|undefined)=>value?new Date(value).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false}):"—";
 
 export function formatHelp(){
-  return ["可用指令",...commandList.map(([name,description])=>`${name} — ${description}`),"","只读指令，不会改变任何交易状态。"].join("\n");
+  return ["可用指令",...commandList.map(([name,description])=>`${name} — ${description}`),
+    "/cc <问题> — 用自然语言提问，由助手查数据后回答",
+    "","只读指令，不会改变任何交易状态。",
+    "/cc 只在助手会话在线时有人应答；离线时消息会存下但不会被回复。"].join("\n");
 }
 
 export interface StatusInput{
