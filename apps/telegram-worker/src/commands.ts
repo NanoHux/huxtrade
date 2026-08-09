@@ -96,11 +96,16 @@ export function formatPositions(rows:PositionRow[]){
 export interface WorkingOrderRow{
   code:string;direction:string;level:number;marketPrice:number|null;
   distanceAtr:number|null;expectedRiskReward:number|null;sources:string[];ageMinutes:number;
+  /** True while the level is held locally and nothing has reached the venue. */
+  awaitingTrigger:boolean;
+  /** True once price has touched the level and the two confirming closes are pending. */
+  touched:boolean;
 }
 export function formatWorkingOrders(rows:WorkingOrderRow[]){
   if(!rows.length)return "当前没有工作中的挂单。";
-  return [`⏳ 驻留挂单 ${rows.length} 张`,...rows.map((row)=>
-    [`${row.code} ${directionLabel(row.direction)}　挂单 ${num(row.level,4)}`,
+  const virtual=rows.filter((row)=>row.awaitingTrigger).length;
+  return [`⏳ 挂单 ${rows.length} 张（虚拟 ${virtual} / 平台 ${rows.length-virtual}）`,...rows.map((row)=>
+    [`${row.code} ${directionLabel(row.direction)}　${row.awaitingTrigger?(row.touched?"确认中":"等待到价"):"平台挂单"} ${num(row.level,4)}`,
      `　距市价 ${row.distanceAtr===null?"—":`${row.distanceAtr.toFixed(2)} ATR`}　盈亏比 ${row.expectedRiskReward===null?"—":row.expectedRiskReward.toFixed(2)}`,
      `　来源 ${row.sources.length?row.sources.join("+"):"—"}　挂龄 ${age(row.ageMinutes)}`].join("\n"))].join("\n");
 }

@@ -224,7 +224,10 @@ app.get("/api/dashboard", async () => {
     query<{ orders:string; fills:string; closed:string; wins:string; pnl:string }>(`SELECT count(*)::text orders,
       count(*) FILTER (WHERE state IN ('FILLED_OPEN','CLOSED_TP','CLOSED_SL','LIQUIDATED'))::text fills,
       count(*) FILTER (WHERE state IN ('CLOSED_TP','CLOSED_SL'))::text closed,
-      count(*) FILTER (WHERE state='CLOSED_TP')::text wins, coalesce(sum(realized_pnl),0)::text pnl FROM orders`),
+      count(*) FILTER (WHERE state='CLOSED_TP')::text wins,
+      -- A scaled-out order realises money twice. realized_pnl is only the
+      -- final exit, so summing it alone hid every banked half.
+      coalesce(sum(coalesce(realized_pnl,0)+coalesce(scaled_out_pnl,0)),0)::text pnl FROM orders`),
     query<{ value:Record<string,unknown> }>("SELECT value FROM app_state WHERE key='global_pause'"),
     query<{ value:Record<string,unknown> }>("SELECT value FROM app_state WHERE key='account_risk'"),
     query<{ value:Record<string,unknown> }>("SELECT value FROM app_state WHERE key='variational_session'"),
@@ -376,12 +379,13 @@ app.get("/api/fills",async(request)=>{
  * which is exactly the number the decision was made against.
  */
 app.get("/api/resting-orders", async () => (await query(`SELECT o.id,o.direction,o.state,o.entry_price,o.stop_loss,o.take_profit,o.margin_usdc,
-  o.entry_provenance,o.revalidated_at,o.created_at,o.platform_order_id,a.code,a.variational_url,
+  o.entry_provenance,o.revalidated_at,o.created_at,o.platform_order_id,o.awaiting_trigger,o.trigger_touched_at,a.code,a.variational_url,
   i.price market_price,i.closed_at market_closed_at,
   (SELECT p.decision_reason FROM entry_plans p WHERE p.working_order_id=o.id ORDER BY p.closed_at DESC LIMIT 1) last_decision_reason
   FROM orders o JOIN assets a ON a.id=o.asset_id
   LEFT JOIN LATERAL (SELECT price,closed_at FROM indicator_snapshots s WHERE s.asset_id=o.asset_id ORDER BY closed_at DESC LIMIT 1) i ON true
-  WHERE o.state='PENDING_ENTRY' AND o.entry_kind='RESTING_LIMIT' ORDER BY o.created_at`)).rows.map((raw)=>{
+  WHERE o.entry_kind='RESTING_LIMIT' AND (o.state='PENDING_ENTRY' OR (o.state='CREATED_LOCAL' AND o.awaiting_trigger))
+  ORDER BY o.awaiting_trigger DESC,o.created_at`)).rows.map((raw)=>{
   const row=raw as Record<string,unknown>;
   const provenance=row.entry_provenance as {atr1h?:number;sources?:string[];score?:number}|null;
   const level=Number(row.entry_price),market=row.market_price==null?null:Number(row.market_price);
@@ -390,6 +394,10 @@ app.get("/api/resting-orders", async () => (await query(`SELECT o.id,o.direction
   const risk=Math.abs(level-Number(row.stop_loss));
   return {
     id:row.id,code:row.code,direction:row.direction,level,stopLoss:Number(row.stop_loss),takeProfit:Number(row.take_profit),
+    // A virtual entry is held locally and has nothing on the venue yet: the
+    // board has to say so, or an operator reads it as an order that exists.
+    awaitingTrigger:Boolean(row.awaiting_trigger),
+    triggerTouchedAt:row.trigger_touched_at==null?null:new Date(String(row.trigger_touched_at)).toISOString(),
     marginUsdc:row.margin_usdc==null?null:Number(row.margin_usdc),marketPrice:market,
     distanceAtr:distance==null||!atr?null:distance/atr,
     distancePercent:distance==null||!market?null:distance/market*100,
@@ -433,7 +441,7 @@ app.get("/api/resting-statistics",async()=>{
   const [ledger,outcomes]=await Promise.all([
     query<{mode:string;decision:string;count:string}>("SELECT mode,decision,count(*)::text count FROM entry_plans GROUP BY mode,decision"),
     query<{state:string;count:string;avg_rr:string|null;avg_distance:string|null}>(`SELECT o.state,count(*)::text count,
-      avg(CASE WHEN abs(o.entry_price-o.stop_loss)>0 THEN o.realized_pnl/(o.margin_usdc*abs(o.entry_price-o.stop_loss)/o.entry_price*o.leverage) END)::text avg_rr,
+      avg(CASE WHEN abs(o.entry_price-o.stop_loss)>0 THEN (coalesce(o.realized_pnl,0)+coalesce(o.scaled_out_pnl,0))/(o.margin_usdc*abs(o.entry_price-o.stop_loss)/o.entry_price*o.leverage) END)::text avg_rr,
       avg(abs((o.entry_provenance->>'referencePrice')::numeric-o.entry_price)/nullif((o.entry_provenance->>'atr1h')::numeric,0))::text avg_distance
       FROM orders o WHERE o.entry_kind='RESTING_LIMIT' AND o.state IN ('CLOSED_TP','CLOSED_SL','LIQUIDATED','CLOSED_REVERSED') GROUP BY o.state`)
   ]);
@@ -454,7 +462,7 @@ app.get("/api/statistics", async () => {const summary=(await query(`SELECT s.id,
   (SELECT count(*) FROM orders o WHERE o.strategy_id=s.id AND o.state IN ('FILLED_OPEN','CLOSED_TP','CLOSED_SL','LIQUIDATED'))::int fills,
   (SELECT count(*) FROM orders o WHERE o.strategy_id=s.id AND o.state IN ('CLOSED_TP','CLOSED_SL'))::int closed,
   (SELECT count(*) FROM orders o WHERE o.strategy_id=s.id AND o.state='CLOSED_TP')::int wins,
-  coalesce((SELECT sum(o.realized_pnl) FROM orders o WHERE o.strategy_id=s.id),0)::float realized_pnl
+  coalesce((SELECT sum(coalesce(o.realized_pnl,0)+coalesce(o.scaled_out_pnl,0)) FROM orders o WHERE o.strategy_id=s.id),0)::float realized_pnl
   FROM strategies s ORDER BY s.created_at`)).rows;const outcomes=await query<{strategy_id:string;state:string}>("SELECT strategy_id,state FROM orders WHERE state IN ('CLOSED_TP','CLOSED_SL') ORDER BY updated_at");return summary.map((row)=>{let wins=0,losses=0,maxConsecutiveWins=0,maxConsecutiveLosses=0;for(const outcome of outcomes.rows.filter((item)=>item.strategy_id===row.id)){if(outcome.state==="CLOSED_TP"){wins+=1;losses=0;maxConsecutiveWins=Math.max(maxConsecutiveWins,wins);}else{losses+=1;wins=0;maxConsecutiveLosses=Math.max(maxConsecutiveLosses,losses);}}return {...row,max_consecutive_wins:maxConsecutiveWins,max_consecutive_losses:maxConsecutiveLosses};});});
 
 app.get("/api/signals",async(request)=>{

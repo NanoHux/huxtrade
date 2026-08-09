@@ -202,7 +202,7 @@ export function resolveRestingEntry(overrides?:Partial<RestingEntrySettings>|nul
   // positive-only merge above would have silently ignored it.
   // 0 is meaningful for each of these — it switches the rule off — so the
   // positive-only merge above would silently restore the default instead.
-  for(const key of ["extremeMoveBlockPercent","lossStreakCount","structuralRejectionLimit"] as const){
+  for(const key of ["extremeMoveBlockPercent","lossStreakCount","structuralRejectionLimit","virtualEntryConfirmation"] as const){
     const value=overrides?.[key];
     if(typeof value==="number"&&Number.isFinite(value)&&value>=0)resolved[key]=value;
   }
@@ -311,6 +311,56 @@ export function assetsInStructuralBackoff(rejections:StructuralRejection[],now:s
     if(until>nowMs)rested.set(assetId,{until:new Date(until).toISOString(),count:times.length});
   }
   return rested;
+}
+
+export type VirtualEntryAction="WAIT"|"SUBMIT"|"ABANDON";
+
+export interface VirtualEntryCandle{openTime:number;open:number;high:number;low:number;close:number}
+
+/**
+ * Whether a virtual entry has earned a real order yet.
+ *
+ * A resting limit order fills passively: price arrives, the order is taken,
+ * and the model finds out afterwards. This asks for the price to arrive first
+ * and then for two 5m closes to not contradict the trade before anything is
+ * put on the venue — the model chooses to enter rather than being entered.
+ *
+ * The rejection is deliberately narrow: only BOTH candles closing against the
+ * trade abandons it. One red and one green is noise, not a verdict, and
+ * demanding two confirmations in the trade's favour would refuse most entries
+ * at exactly the level the model waited for.
+ *
+ * Cancelling a virtual entry costs nothing, which is what justifies asking.
+ */
+export function confirmVirtualEntry(input:{
+  direction:Direction;level:number;candles:VirtualEntryCandle[];
+  touchedAt?:number|null;nowMs:number;intervalMs?:number;
+}):{action:VirtualEntryAction;touchedAt?:number;reason:string}{
+  const step=input.intervalMs??300_000;
+  const closed=input.candles.filter((candle)=>candle.openTime+step<=input.nowMs).sort((a,b)=>a.openTime-b.openTime);
+  if(!closed.length)return {action:"WAIT",reason:"no closed 5m candle yet"};
+  const touches=(candle:VirtualEntryCandle)=>input.direction==="LONG"?candle.low<=input.level:candle.high>=input.level;
+  // The FIRST touch is the one that starts the clock; later touches must not
+  // keep sliding the window forward or the confirmation never resolves.
+  let touchedAt=input.touchedAt??null;
+  if(touchedAt===null){
+    const first=closed.find(touches);
+    if(!first)return {action:"WAIT",reason:`price has not reached ${input.level} yet`};
+    touchedAt=first.openTime;
+  }
+  const trigger=closed.find((candle)=>candle.openTime===touchedAt);
+  const next=closed.find((candle)=>candle.openTime===touchedAt+step);
+  if(!next){
+    // Still waiting for the second candle, unless the window has already moved
+    // past it — then the candles needed to decide are simply gone.
+    const newest=closed.at(-1)!;
+    if(newest.openTime>touchedAt+step||!trigger)return {action:"ABANDON",touchedAt,reason:"the confirmation candles are no longer available to judge"};
+    return {action:"WAIT",touchedAt,reason:"waiting for the second 5m close"};
+  }
+  if(!trigger)return {action:"ABANDON",touchedAt,reason:"the candle that reached the level is no longer available to judge"};
+  const against=(candle:VirtualEntryCandle)=>input.direction==="LONG"?candle.close<candle.open:candle.close>candle.open;
+  if(against(trigger)&&against(next))return {action:"ABANDON",touchedAt,reason:`both 5m closes went against the ${input.direction}`};
+  return {action:"SUBMIT",touchedAt,reason:`price reached ${input.level} and the two 5m closes did not contradict the ${input.direction}`};
 }
 
 export type ScaleOutAction="SCALE_OUT"|"NONE";
@@ -743,7 +793,10 @@ export function riskGate(input: { globalPaused: boolean; assetPaused: boolean; d
 }
 
 export const validOrderTransitions: Record<string, string[]> = {
-  CREATED_LOCAL: ["SUBMITTING", "SUBMISSION_FAILED"],
+  // CANCELLED_REPLACED from CREATED_LOCAL is a virtual entry withdrawn before
+  // it ever reached the venue — the two confirmation candles went against the
+  // trade, or the 15m revalidation dropped it while it was still waiting.
+  CREATED_LOCAL: ["SUBMITTING", "SUBMISSION_FAILED", "CANCELLED_REPLACED"],
   SUBMITTING: ["PENDING_ENTRY", "FILLED_OPEN", "SUBMISSION_FAILED", "UNKNOWN"],
   // CANCELLED_REPLACED is terminal and distinct from CANCELLED_EXTERNALLY: the
   // resting model cancels its own working orders on purpose every time the

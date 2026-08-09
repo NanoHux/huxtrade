@@ -164,7 +164,12 @@ export const fixedRules = Object.freeze({
     // fill market-closed a position that still had its own defined risk. A
     // flip now has to be asserted this many times, with no intervening
     // confirmation of the original direction, before anything is acted on.
-    flipConfirmationScans: 2,
+    // One counter-signal is enough to withdraw an UNFILLED order: cancelling
+    // costs nothing but a round trip, so the asymmetry that justified waiting
+    // for a second assertion does not exist here. Filled positions are never
+    // closed on a direction signal at all (revalidateWorkingOrder rule 4), so
+    // this number has never governed them.
+    flipConfirmationScans: 1,
     // Every tracked asset may arm at once. If Phase 0 P0-2 shows that resting
     // orders lock initial margin, lowering this is the lever that stops the
     // account parking its whole margin in orders that never fill.
@@ -258,7 +263,17 @@ export const fixedRules = Object.freeze({
     // `structuralBackoffHours`. Transient venue refusals (skew limits) and
     // network failures are deliberately excluded — those clear on their own.
     structuralRejectionLimit: 3,
-    structuralBackoffHours: 6
+    structuralBackoffHours: 6,
+    // Virtual entries. The level is tracked locally and nothing reaches the
+    // venue until price arrives AND two 5m closes decline to contradict the
+    // trade. A resting limit order is filled TO you — price arrives, the order
+    // is taken, and the model learns about it afterwards; this makes the last
+    // step a decision instead. Cancelling a virtual entry costs nothing, which
+    // is what makes the extra question worth asking. Set false to go back to
+    // posting the limit order immediately.
+    virtualEntryConfirmation: 1,
+    // Confirmation runs on the close of 5m candles.
+    virtualEntryIntervalMinutes: 5
   }),
   // Whitelist size. Every asset costs one CoinGlass heatmap capture and one
   // Binance round trip per 15-minute scan, which is the real constraint — the

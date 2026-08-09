@@ -393,7 +393,7 @@ async function claimWork(){
     // (a reversal close waiting on the session) yields its place at the head of
     // the queue instead of starving everything behind it. Everything else
     // inserts with the now() default and is unaffected.
-    const result=await client.query<Record<string,unknown>>("SELECT * FROM outbox WHERE topic IN ('order.submit','order.place_resting','order.cancel_replace','order.cancel_working','order.close_opposite','control.global_pause','control.global_resume','strategy.changed') AND status='pending' AND available_at<=now() ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1");
+    const result=await client.query<Record<string,unknown>>("SELECT * FROM outbox WHERE topic IN ('order.submit','order.place_resting','order.confirm_resting','order.cancel_replace','order.cancel_working','order.close_opposite','control.global_pause','control.global_resume','strategy.changed') AND status='pending' AND available_at<=now() ORDER BY id FOR UPDATE SKIP LOCKED LIMIT 1");
     if(!result.rows[0])return null;
     await client.query("UPDATE outbox SET status='processing' WHERE id=$1",[result.rows[0].id]);return result.rows[0];
   });
@@ -698,7 +698,28 @@ async function handlePlaceResting(item:Record<string,unknown>){
     await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({skipped:order?`order already ${order.state}`:"order row could not be created"}),item.id]);
     return;
   }
+  // A virtual entry stops here: the row exists, the level is recorded, and
+  // nothing is put on the venue until signal-engine sees price arrive and two
+  // 5m closes decline to contradict the trade.
+  if((await scaleOutSettings()).virtualEntryConfirmation>0){
+    await query("UPDATE orders SET awaiting_trigger=true,updated_at=now() WHERE id=$1",[order.id]);
+    await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({held:"awaiting price and two 5m closes"}),item.id]);
+    return;
+  }
   await submitOrder(item,order.id,context.plan);
+}
+
+/** The confirmed half of a virtual entry: the same plan, now put on the venue. */
+async function handleConfirmResting(item:Record<string,unknown>){
+  const payload=item.payload as {orderId:string;plan:OrderPlan};
+  const order=(await query<{state:string;platform_order_id:string|null;awaiting_trigger:boolean}>(
+    "SELECT state,platform_order_id,awaiting_trigger FROM orders WHERE id=$1",[payload.orderId])).rows[0];
+  if(!order||!order.awaiting_trigger||!restingOrderIsSubmittable({state:order.state,platformOrderId:order.platform_order_id})){
+    await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({skipped:order?`order is ${order.state}, awaiting_trigger=${order.awaiting_trigger}`:"order row is gone"}),item.id]);
+    return;
+  }
+  await query("UPDATE orders SET awaiting_trigger=false,updated_at=now() WHERE id=$1",[payload.orderId]);
+  await submitOrder(item,payload.orderId,payload.plan);
 }
 
 /**
@@ -712,7 +733,15 @@ async function handlePlaceResting(item:Record<string,unknown>){
  */
 async function handleCancelReplace(item:Record<string,unknown>){
   const context=item.payload as RestingContext&{oldOrderId:string};
-  const previous=(await query<{state:string;asset_id:string;platform_order_id:string|null}>("SELECT state,asset_id,platform_order_id FROM orders WHERE id=$1",[context.oldOrderId])).rows[0];
+  const previous=(await query<{state:string;asset_id:string;platform_order_id:string|null;awaiting_trigger:boolean}>("SELECT state,asset_id,platform_order_id,awaiting_trigger FROM orders WHERE id=$1",[context.oldOrderId])).rows[0];
+  // A virtual predecessor has nothing on the venue to cancel, only a local row
+  // to close out. Falling through to the PENDING_ENTRY branch left it open
+  // forever: ETH and DEXE each ended up holding an orphaned virtual entry
+  // beside their live replacement.
+  if(previous&&previous.state==="CREATED_LOCAL"&&previous.awaiting_trigger){
+    await query("UPDATE orders SET awaiting_trigger=false,updated_at=now() WHERE id=$1",[context.oldOrderId]);
+    await setState(context.oldOrderId,"CREATED_LOCAL","CANCELLED_REPLACED",context.reason??"the structural level moved; the virtual entry is replaced");
+  }
   if(previous&&previous.state==="PENDING_ENTRY"){
     if(!previous.platform_order_id){
       await recordBusinessError({service:"variational-agent",assetId:context.assetId,code:"RESTING_REPLACE_CANCEL_FAILED",message:"the working order has no platform order ID, so it cannot be cancelled by ID",blocksTrading:false,context:{orderId:context.oldOrderId}});
@@ -740,6 +769,15 @@ async function handleCancelReplace(item:Record<string,unknown>){
   }
   // Only now that the replacement exists can the audit trail point at it.
   if(previous)await query("UPDATE orders SET replaced_by=$1,updated_at=now() WHERE id=$2",[order.id,context.oldOrderId]);
+  // A replacement is an entry like any other: under virtual confirmation it
+  // waits for price and two closes rather than going straight to the venue.
+  // Omitting this here is what put ETH and DEXE on the platform at a level
+  // price had never reached.
+  if((await scaleOutSettings()).virtualEntryConfirmation>0){
+    await query("UPDATE orders SET awaiting_trigger=true,updated_at=now() WHERE id=$1",[order.id]);
+    await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({held:"awaiting price and two 5m closes"}),item.id]);
+    return;
+  }
   await submitOrder(item,order.id,context.plan,"REPLACEMENT");
 }
 
@@ -753,7 +791,16 @@ async function handleCancelReplace(item:Record<string,unknown>){
  */
 async function handleCancelWorking(item:Record<string,unknown>){
   const payload=item.payload as {orderId:string;assetId:string;reason?:string};
-  const order=(await query<{state:string;platform_order_id:string|null}>("SELECT state,platform_order_id FROM orders WHERE id=$1",[payload.orderId])).rows[0];
+  const order=(await query<{state:string;platform_order_id:string|null;awaiting_trigger:boolean}>("SELECT state,platform_order_id,awaiting_trigger FROM orders WHERE id=$1",[payload.orderId])).rows[0];
+  // A virtual entry has nothing on the venue to cancel. Withdrawing it is a
+  // local state change, and it must still happen — otherwise the model would
+  // keep a level it has already decided against.
+  if(order&&order.awaiting_trigger&&order.state==="CREATED_LOCAL"&&!order.platform_order_id){
+    await query("UPDATE orders SET awaiting_trigger=false,updated_at=now() WHERE id=$1",[payload.orderId]);
+    await setState(payload.orderId,"CREATED_LOCAL","CANCELLED_REPLACED",payload.reason??"virtual entry withdrawn before reaching the venue");
+    await query("UPDATE outbox SET status='sent',sent_at=now() WHERE id=$1",[item.id]);
+    return;
+  }
   if(!order||order.state!=="PENDING_ENTRY"||!order.platform_order_id){
     await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({skipped:!order?"the order no longer exists":order.state!=="PENDING_ENTRY"?`the order is already ${order.state}`:"the order has no platform order ID"}),item.id]);
     return;
@@ -807,6 +854,8 @@ async function tick(){
     // Withdrawing and closing are reductions, so they follow the same rule as
     // global_pause's cancelManagedPending: gated on the session, not on
     // LIVE_TRADING_ENABLED, which exists to stop new exposure.
+    }else if(item.topic==="order.confirm_resting"){
+      if(submitReady)await handleConfirmResting(item);
     }else if(item.topic==="order.cancel_working"){
       if(valid&&reconciled)await handleCancelWorking(item);
       else await query("UPDATE outbox SET status='pending',available_at=now()+interval '1 minute' WHERE id=$1",[item.id]);

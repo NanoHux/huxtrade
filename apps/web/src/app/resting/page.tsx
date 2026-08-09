@@ -8,6 +8,10 @@ export interface RestingOrderRow{
   marginUsdc:number|null;marketPrice:number|null;distanceAtr:number|null;distancePercent:number|null;
   expectedRiskReward:number|null;sources:string[];score:number|null;ageMinutes:number;
   revalidatedAt:string|null;createdAt:string;lastDecisionReason:string|null;variationalUrl:string;
+  /** True while the level is held locally and nothing has been sent to the venue. */
+  awaitingTrigger:boolean;
+  /** Open time of the 5m candle that first reached the level, once it has. */
+  triggerTouchedAt:string|null;
 }
 export interface EntryPlanRow{
   id:string;code:string;closed_at:string;direction:string|null;level:string|null;stop_loss:string|null;

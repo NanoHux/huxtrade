@@ -240,3 +240,18 @@ describe("formatDirectionHalted",()=>{
     expect(text).toContain("已有持仓不受影响");
   });
 });
+
+describe("formatWorkingOrders separates virtual entries from posted ones",()=>{
+  const base={marketPrice:100,distanceAtr:0.4,expectedRiskReward:3.2,sources:["HEATMAP"],ageMinutes:12};
+  it("says which are held locally and which reached the venue",()=>{
+    const text=formatWorkingOrders([
+      {...base,code:"ETH",direction:"SHORT",level:1922.02,awaitingTrigger:true,touched:false},
+      {...base,code:"ZEC",direction:"SHORT",level:531.44,awaitingTrigger:true,touched:true},
+      {...base,code:"TAO",direction:"LONG",level:202.34,awaitingTrigger:false,touched:false}
+    ]);
+    expect(text).toContain("虚拟 2 / 平台 1");
+    expect(text).toContain("等待到价");
+    expect(text).toContain("确认中");
+    expect(text).toContain("平台挂单");
+  });
+});

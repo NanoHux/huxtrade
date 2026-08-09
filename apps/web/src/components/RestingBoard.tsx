@@ -18,10 +18,21 @@ export function RestingBoard({orders,plans,total,stats}:{orders:RestingOrderRow[
 
   return <div className="pageGrid">
     <section className="panel">
-      <div className="panelHead"><div><h2>工作挂单</h2><small>每 15 分钟收盘重新校验；距市价以 1h ATR 为单位</small></div><span className="tag">{orders.length} 张</span></div>
-      <table><thead><tr><th>币种</th><th>方向</th><th>挂单价</th><th>市价</th><th>距市价</th><th>RR</th><th>来源</th><th>挂龄</th><th>最近校验</th><th>止损 / 止盈</th></tr></thead>
+      <div className="panelHead">
+        <div><h2>工作挂单</h2><small>虚拟单只存在本地，价格到位并经两根 5 分钟收线确认后才发到平台；每 15 分钟重新校验</small></div>
+        <div className="toolbar">
+          <span className="tag orange">{orders.filter((order)=>order.awaitingTrigger).length} 虚拟</span>
+          <span className="tag">{orders.filter((order)=>!order.awaitingTrigger).length} 已挂平台</span>
+        </div>
+      </div>
+      <table><thead><tr><th>币种</th><th>状态</th><th>方向</th><th>入场价</th><th>市价</th><th>距市价</th><th>RR</th><th>来源</th><th>挂龄</th><th>最近校验</th><th>止损 / 止盈</th></tr></thead>
       <tbody>{orders.map((order)=><tr key={order.id}>
         <td><a href={order.variationalUrl} target="_blank" rel="noreferrer"><b>{order.code}</b></a></td>
+        <td>{order.awaitingTrigger
+          ? <span className="tag orange" title={order.triggerTouchedAt?`价格已于 ${clock(order.triggerTouchedAt)} 触及，等待两根 5 分钟收线确认`:"等待价格到达入场价"}>
+              {order.triggerTouchedAt?"确认中":"等待到价"}
+            </span>
+          : <span className="tag">平台挂单</span>}</td>
         <td><span className={`tag ${order.direction==="LONG"?"":"orange"}`}>{order.direction}</span></td>
         <td className="mono">{num(order.level)}</td>
         <td className="mono">{num(order.marketPrice)}</td>
@@ -32,7 +43,7 @@ export function RestingBoard({orders,plans,total,stats}:{orders:RestingOrderRow[
         <td title={order.lastDecisionReason??""}>{clock(order.revalidatedAt)}</td>
         <td className="mono">{num(order.stopLoss)} / {num(order.takeProfit)}</td>
       </tr>)}
-      {!orders.length&&<tr><td colSpan={10} className="empty">当前没有工作挂单</td></tr>}</tbody></table>
+      {!orders.length&&<tr><td colSpan={11} className="empty">当前没有工作挂单</td></tr>}</tbody></table>
     </section>
 
     <section className="panel">

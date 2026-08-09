@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Direction, HeatmapRegion, OrderPlan } from "@huxtrade/shared-types";
-import { assetsInStructuralBackoff, biasDecision, breakevenStopPrice, breakevenThroughMarket, chooseEntryLevel, stopClearsSpread, classifyExitByPrice, directionAllowedAfterMove, haltedDirections, limitArmedAssets, makeRestingOrderPlan, neutralBias, resolveRestingEntry, restingEntryDefaults, revalidateWorkingOrder, scaleOutDecision, type BiasState, type EntryCandidate } from "./index.js";
+import { assetsInStructuralBackoff, biasDecision, confirmVirtualEntry, breakevenStopPrice, breakevenThroughMarket, chooseEntryLevel, stopClearsSpread, classifyExitByPrice, directionAllowedAfterMove, haltedDirections, limitArmedAssets, makeRestingOrderPlan, neutralBias, resolveRestingEntry, restingEntryDefaults, revalidateWorkingOrder, scaleOutDecision, type BiasState, type EntryCandidate } from "./index.js";
 
 const region=(low:number,high:number,percentile:number,intensity=percentile*100):HeatmapRegion=>
   ({price:(low+high)/2,lowPrice:low,highPrice:high,intensity,percentile,rank:1});
@@ -26,10 +26,11 @@ describe("bias arming",()=>{
   });
 
   it("flips only once the reversal has been confirmed",()=>{
-    // Superseded the old flip-on-sight rule: see the "reversal confirmation"
-    // block for why one counter-signal is not a reversal.
+    // Pinned at two confirmations: this asserts the contesting mechanism, not
+    // the shipped default of one. See "withdrawing an unfilled order".
+    const twice=resolveRestingEntry({flipConfirmationScans:2});
     const armed=biasDecision(neutralBias,scan(0,"LONG"));
-    const flipped=biasDecision(biasDecision(armed,scan(15,"SHORT")),scan(30,"SHORT"));
+    const flipped=biasDecision(biasDecision(armed,scan(15,"SHORT"),twice),scan(30,"SHORT"),twice);
     expect(flipped).toMatchObject({action:"FLIP",direction:"SHORT",armedAt:at(30),armedUntil:at(90)});
     expect(flipped.reason).toContain("reversed the LONG bias to SHORT");
   });
@@ -335,10 +336,14 @@ describe("incumbency",()=>{
 describe("reversal confirmation",()=>{
   const at=(minutes:number)=>new Date(Date.UTC(2026,7,7,0,0,0)+minutes*60_000).toISOString();
   const scan=(minutes:number,...passedDirections:Direction[])=>({closedAt:at(minutes),passedDirections});
+  // The mechanism, pinned at two so these keep testing HOW contesting works
+  // rather than what the current default happens to be. The shipped default
+  // is one — see "withdrawing an unfilled order" below for why.
+  const twice=resolveRestingEntry({flipConfirmationScans:2});
 
   it("does not reverse on a single counter-signal",()=>{
     const armed=biasDecision(neutralBias,scan(0,"LONG"));
-    const contested=biasDecision(armed,scan(15,"SHORT"));
+    const contested=biasDecision(armed,scan(15,"SHORT"),twice);
     expect(contested).toMatchObject({action:"CONTEST",direction:"LONG",pendingFlipDirection:"SHORT",pendingFlipCount:1});
     // The old bias is held but deliberately not extended, so a persistent
     // contradiction lets it lapse instead of ruling forever.
@@ -347,29 +352,29 @@ describe("reversal confirmation",()=>{
 
   it("reverses once the counter-direction has asserted itself enough",()=>{
     const armed=biasDecision(neutralBias,scan(0,"LONG"));
-    const contested=biasDecision(armed,scan(15,"SHORT"));
-    const flipped=biasDecision(contested,scan(30,"SHORT"));
+    const contested=biasDecision(armed,scan(15,"SHORT"),twice);
+    const flipped=biasDecision(contested,scan(30,"SHORT"),twice);
     expect(flipped).toMatchObject({action:"FLIP",direction:"SHORT",pendingFlipCount:0,pendingFlipDirection:null});
     expect(flipped.reason).toContain("after 2 counter-signals");
   });
 
   it("lets the original direction reassert itself and drop the argument",()=>{
     const armed=biasDecision(neutralBias,scan(0,"LONG"));
-    const contested=biasDecision(armed,scan(15,"SHORT"));
-    const reconfirmed=biasDecision(contested,scan(30,"LONG"));
+    const contested=biasDecision(armed,scan(15,"SHORT"),twice);
+    const reconfirmed=biasDecision(contested,scan(30,"LONG"),twice);
     expect(reconfirmed).toMatchObject({action:"REFRESH",direction:"LONG",pendingFlipCount:0,pendingFlipDirection:null});
     // Having been reset, the next counter-signal starts the count over.
-    expect(biasDecision(reconfirmed,scan(45,"SHORT"))).toMatchObject({action:"CONTEST",pendingFlipCount:1});
+    expect(biasDecision(reconfirmed,scan(45,"SHORT"),twice)).toMatchObject({action:"CONTEST",pendingFlipCount:1});
   });
 
   it("treats silent scans as neither confirming nor resetting",()=>{
     // Most scans pass nothing, so requiring adjacent bars would make a
     // genuine reversal practically unreachable.
     const armed=biasDecision(neutralBias,scan(0,"LONG"));
-    const contested=biasDecision(armed,scan(15,"SHORT"));
-    const quiet=biasDecision(contested,scan(30));
+    const contested=biasDecision(armed,scan(15,"SHORT"),twice);
+    const quiet=biasDecision(contested,scan(30),twice);
     expect(quiet).toMatchObject({action:"HOLD",direction:"LONG",pendingFlipCount:1});
-    expect(biasDecision(quiet,scan(45,"SHORT"))).toMatchObject({action:"FLIP",direction:"SHORT"});
+    expect(biasDecision(quiet,scan(45,"SHORT"),twice)).toMatchObject({action:"FLIP",direction:"SHORT"});
   });
 
   it("is tunable — 1 restores the old flip-on-sight behaviour",()=>{
@@ -380,6 +385,10 @@ describe("reversal confirmation",()=>{
 });
 
 describe("an open position defends itself",()=>{
+  // Pinned at two confirmations: a lapsed bias defended by a position uses
+  // the same counter, and the mechanism is what these assert rather than the
+  // shipped default of one.
+  const confirmTwice=resolveRestingEntry({flipConfirmationScans:2});
   const at=(minutes:number)=>new Date(Date.UTC(2026,7,7,0,0,0)+minutes*60_000).toISOString();
   const scan=(minutes:number,...passedDirections:Direction[])=>({closedAt:at(minutes),passedDirections});
   const lapsed=neutralBias;
@@ -389,7 +398,7 @@ describe("an open position defends itself",()=>{
     // so a single counter-scan used to ARM the opposite side from neutral —
     // which is not a flip, so the gate never saw it — and the position was
     // closed on one bar with no confirmation at all.
-    const contested=biasDecision(lapsed,scan(0,"SHORT"),restingEntryDefaults,"LONG");
+    const contested=biasDecision(lapsed,scan(0,"SHORT"),confirmTwice,"LONG");
     expect(contested).toMatchObject({action:"CONTEST",pendingFlipDirection:"SHORT",pendingFlipCount:1});
     // Still neutral: the model may not open on this side, it merely may not close.
     expect(contested.direction).toBeNull();
@@ -397,9 +406,9 @@ describe("an open position defends itself",()=>{
   });
 
   it("reverses once the counter-direction has argued it away",()=>{
-    const once=biasDecision(lapsed,scan(0,"SHORT"),restingEntryDefaults,"LONG");
-    const twice=biasDecision(once,scan(15,"SHORT"),restingEntryDefaults,"LONG");
-    expect(twice).toMatchObject({action:"FLIP",direction:"SHORT",pendingFlipCount:0});
+    const once=biasDecision(lapsed,scan(0,"SHORT"),confirmTwice,"LONG");
+    const confirmed=biasDecision(once,scan(15,"SHORT"),confirmTwice,"LONG");
+    expect(confirmed).toMatchObject({action:"FLIP",direction:"SHORT",pendingFlipCount:0});
   });
 
   it("arms freely in the direction it is already holding",()=>{
@@ -713,5 +722,93 @@ describe("resting an asset whose submissions keep being refused on their own str
     expect(assetsInStructuralBackoff(run,at(1),resolveRestingEntry({structuralRejectionLimit:0})).size).toBe(0);
     expect(resolveRestingEntry({structuralRejectionLimit:0}).structuralRejectionLimit).toBe(0);
     expect(assetsInStructuralBackoff([{assetId:"paxg",at:"not-a-date"},...run.slice(0,2)],at(1)).size).toBe(0);
+  });
+});
+
+describe("confirming a virtual entry before it becomes a real order",()=>{
+  const step=300_000;
+  const at=(index:number)=>index*step;
+  const bar=(index:number,open:number,close:number,high:number,low:number)=>({openTime:at(index),open,close,high,low});
+  // A SHORT waiting at 100: the level is above the market, so a touch is a high.
+  const short={direction:"SHORT" as const,level:100};
+
+  it("waits until price reaches the level",()=>{
+    const candles=[bar(0,95,96,97,94),bar(1,96,95,97,94)];
+    expect(confirmVirtualEntry({...short,candles,nowMs:at(2)})).toMatchObject({action:"WAIT"});
+  });
+
+  it("waits for the second close once the level is touched",()=>{
+    const candles=[bar(0,99,101,101,98)];
+    const result=confirmVirtualEntry({...short,candles,nowMs:at(1)});
+    expect(result).toMatchObject({action:"WAIT",touchedAt:at(0)});
+  });
+
+  it("submits when the two closes do not both contradict the trade",()=>{
+    // Up then down: one against, one for. Noise, not a verdict.
+    const candles=[bar(0,99,101,101,98),bar(1,101,99,101,98)];
+    expect(confirmVirtualEntry({...short,candles,nowMs:at(2)})).toMatchObject({action:"SUBMIT",touchedAt:at(0)});
+  });
+
+  it("submits when both closes agree with the trade",()=>{
+    const candles=[bar(0,101,99,101,98),bar(1,99,97,100,96)];
+    expect(confirmVirtualEntry({...short,candles,nowMs:at(2)}).action).toBe("SUBMIT");
+  });
+
+  it("abandons only when BOTH closes go against the trade",()=>{
+    const candles=[bar(0,99,100.5,101,98),bar(1,100.5,102,102,100)];
+    const result=confirmVirtualEntry({...short,candles,nowMs:at(2)});
+    expect(result.action).toBe("ABANDON");
+    expect(result.reason).toContain("against the SHORT");
+  });
+
+  it("mirrors for a LONG, where a touch is a low and against means red",()=>{
+    const long={direction:"LONG" as const,level:100};
+    const touchThenTwoRed=[bar(0,101,99,102,99.5),bar(1,99,97,99,96)];
+    expect(confirmVirtualEntry({...long,candles:touchThenTwoRed,nowMs:at(2)}).action).toBe("ABANDON");
+    const touchThenMixed=[bar(0,101,99,102,99.5),bar(1,99,101,102,98)];
+    expect(confirmVirtualEntry({...long,candles:touchThenMixed,nowMs:at(2)}).action).toBe("SUBMIT");
+  });
+
+  it("keeps the FIRST touch as the clock, not the most recent one",()=>{
+    // Touched at bar 0; bar 1 touches again. The pair to judge is 0 and 1,
+    // otherwise a level price keeps brushing would never resolve.
+    const candles=[bar(0,99,100.5,101,98),bar(1,100.5,102,102,100),bar(2,102,101,103,100)];
+    expect(confirmVirtualEntry({...short,candles,nowMs:at(3),touchedAt:at(0)}).action).toBe("ABANDON");
+  });
+
+  it("gives up rather than guess when the deciding candles have scrolled away",()=>{
+    const candles=[bar(5,99,98,99,97),bar(6,98,97,99,96)];
+    expect(confirmVirtualEntry({...short,candles,nowMs:at(7),touchedAt:at(0)}).action).toBe("ABANDON");
+  });
+
+  it("ignores a candle that has not closed yet",()=>{
+    // The touching bar is still open, so there is nothing to confirm from.
+    const candles=[bar(0,99,101,101,98)];
+    expect(confirmVirtualEntry({...short,candles,nowMs:at(0)+1}).action).toBe("WAIT");
+  });
+});
+
+describe("withdrawing an unfilled order",()=>{
+  const at=(minutes:number)=>new Date(Date.UTC(2026,7,7,0,0,0)+minutes*60_000).toISOString();
+  const scan=(minutes:number,...passedDirections:Direction[])=>({closedAt:at(minutes),passedDirections});
+
+  it("reverses on the first counter-signal at the shipped default",()=>{
+    // Cancelling an order that has not filled costs a round trip and nothing
+    // else, so the asymmetry that justified waiting for a second assertion
+    // does not exist here.
+    expect(restingEntryDefaults.flipConfirmationScans).toBe(1);
+    const armed=biasDecision(neutralBias,scan(0,"LONG"));
+    expect(biasDecision(armed,scan(15,"SHORT"))).toMatchObject({action:"FLIP",direction:"SHORT"});
+  });
+
+  it("still never closes a filled position on a direction signal",()=>{
+    // The red line is in revalidateWorkingOrder, not in the confirmation
+    // count: a held position is left to its own stop and target however many
+    // times the signal argues the other way.
+    const held={orderId:"order-1",direction:"LONG" as const};
+    const flipped:BiasState={direction:"SHORT",armedAt:at(15),armedUntil:at(135)};
+    const decision=revalidateWorkingOrder({bias:flipped,workingOrder:null,newPlan:undefined,closePrice:100,atr1h:2,tradable:true,openPosition:held});
+    expect(decision.action).toBe("NONE");
+    expect(decision.reason).toContain("left to its own stop and target");
   });
 });

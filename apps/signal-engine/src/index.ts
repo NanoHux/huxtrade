@@ -2,7 +2,7 @@ import { fixedRules, getConfig } from "@huxtrade/config";
 import { claimRestartRequest, pool, query, recordHealth, transaction } from "@huxtrade/database";
 import { BinanceFuturesClient,variationalUnderlying } from "@huxtrade/exchange-clients";
 import { atr, findAtrSwing } from "@huxtrade/indicators";
-import { candidateDirections, directionAllowed, directionAllowedAfterMove, assetsInStructuralBackoff, evaluateConditions, haltedDirections, heatmapEntryState, makeOrderPlan, neutralBias, resolveRestingEntry, riskGate, type BiasState, type WorkingRestingOrder } from "@huxtrade/strategy-engine";
+import { candidateDirections, directionAllowed, directionAllowedAfterMove, assetsInStructuralBackoff, confirmVirtualEntry, evaluateConditions, haltedDirections, heatmapEntryState, makeOrderPlan, neutralBias, resolveRestingEntry, riskGate, type BiasState, type WorkingRestingOrder } from "@huxtrade/strategy-engine";
 import type { ConditionResult, Direction, HeatmapRegion, OrderPlan, Strategy } from "@huxtrade/shared-types";
 import { decideRestingScan, restingOutboxMessage, type RestingAssetInput } from "./resting.js";
 import { timestampIso } from "./time.js";
@@ -123,6 +123,64 @@ async function announceHalts(halts:Array<{direction:string;until:string;count:nu
   }
 }
 
+/**
+ * Virtual entries: hold the level locally, and only put a real order on the
+ * venue once price has arrived AND two candle closes decline to contradict
+ * the trade.
+ *
+ * The plan is rebuilt from the stored row rather than recomputed — the price,
+ * stop and target are the ones the structure produced when the level was
+ * chosen, and re-deriving them here would silently enter on a different plan
+ * from the one that was revalidated.
+ *
+ * Throttled to one pass per candle interval: the outer loop runs every 30
+ * seconds, and nothing can change between closes.
+ */
+let lastVirtualBucket=0;
+async function evaluateVirtualEntries(strategy:Strategy){
+  const settings=strategy.restingEntry;
+  if(!(settings.virtualEntryConfirmation>0))return;
+  const stepMs=Math.max(1,settings.virtualEntryIntervalMinutes)*60_000;
+  const bucket=Math.floor(Date.now()/stepMs);
+  if(bucket===lastVirtualBucket)return;
+  lastVirtualBucket=bucket;
+  const pending=await query<Record<string,unknown>>(`SELECT o.*,a.binance_symbol,a.variational_url,a.code
+    FROM orders o JOIN assets a ON a.id=o.asset_id
+    WHERE o.state='CREATED_LOCAL' AND o.awaiting_trigger`);
+  const interval=`${Math.max(1,settings.virtualEntryIntervalMinutes)}m`;
+  for(const row of pending.rows){
+    const direction=row.direction==="LONG"?"LONG" as const:"SHORT" as const;
+    const level=Number(row.entry_price);
+    let candles;
+    try{candles=await binance.klines(String(row.binance_symbol),interval,8);}
+    catch{continue;}
+    const result=confirmVirtualEntry({
+      direction,level,candles,nowMs:Date.now(),intervalMs:stepMs,
+      touchedAt:row.trigger_touched_at?new Date(String(row.trigger_touched_at)).getTime():null
+    });
+    if(result.touchedAt!==undefined&&!row.trigger_touched_at){
+      await query("UPDATE orders SET trigger_touched_at=$1,updated_at=now() WHERE id=$2",[new Date(result.touchedAt).toISOString(),row.id]);
+    }
+    if(result.action==="WAIT")continue;
+    if(result.action==="ABANDON"){
+      await query("INSERT INTO outbox(topic,payload) VALUES('order.cancel_working',$1)",[JSON.stringify({
+        orderId:String(row.id),assetId:String(row.asset_id),reason:`virtual entry withdrawn: ${result.reason}`
+      })]);
+      continue;
+    }
+    const plan={
+      idempotencyKey:String(row.idempotency_key),symbol:String(row.binance_symbol),
+      venueSymbol:variationalUnderlying(row.variational_url as string|null,String(row.binance_symbol)),
+      direction,entryPrice:level,stopLoss:Number(row.stop_loss),takeProfit:Number(row.take_profit),
+      expectedRiskReward:Math.abs(Number(row.take_profit)-level)/Math.abs(level-Number(row.stop_loss)),
+      marginUsdc:Number(row.margin_usdc),leverage:Number(row.leverage),
+      notionalUsdc:Number(row.margin_usdc)*Number(row.leverage),
+      entryKind:"RESTING_LIMIT" as const,entryProvenance:row.entry_provenance as OrderPlan["entryProvenance"]
+    };
+    await query("INSERT INTO outbox(topic,payload) VALUES('order.confirm_resting',$1)",[JSON.stringify({orderId:String(row.id),plan,reason:result.reason})]);
+  }
+}
+
 async function run(){
   try{
     const strategyRow=(await query<Record<string,unknown>>("SELECT * FROM strategies WHERE enabled=true LIMIT 1")).rows[0];
@@ -179,7 +237,11 @@ async function run(){
     // One working resting order and one open position per asset, read once for
     // the whole batch rather than per asset per direction.
     const [workingRows,positionRows]=await Promise.all([
-      query<{id:string;asset_id:string;direction:Direction;entry_price:string;stop_loss:string}>(`SELECT id,asset_id,direction,entry_price,stop_loss FROM orders WHERE state='PENDING_ENTRY' AND entry_kind='RESTING_LIMIT'`),
+      // Virtual entries revalidate exactly like posted ones: a level the model
+      // has stopped believing in must be dropped whether or not the venue has
+      // seen it, and the structure it leans on moves at the same 15m cadence.
+      query<{id:string;asset_id:string;direction:Direction;entry_price:string;stop_loss:string}>(`SELECT id,asset_id,direction,entry_price,stop_loss FROM orders
+        WHERE entry_kind='RESTING_LIMIT' AND (state='PENDING_ENTRY' OR (state='CREATED_LOCAL' AND awaiting_trigger))`),
       query<{id:string;asset_id:string;direction:Direction}>(`SELECT id,asset_id,direction FROM orders WHERE state='FILLED_OPEN'`)
     ]);
     const workingByAsset=new Map(workingRows.rows.map((row)=>[row.asset_id,{orderId:row.id,direction:row.direction,level:Number(row.entry_price),stopLoss:Number(row.stop_loss)} satisfies WorkingRestingOrder]));
@@ -312,6 +374,7 @@ async function run(){
       await query("INSERT INTO asset_signal_cursors(asset_id,closed_at) VALUES($1,$2) ON CONFLICT(asset_id) DO UPDATE SET closed_at=EXCLUDED.closed_at,updated_at=now()",[row.asset_id,row.closed_at]);
     }
     await runRestingScan(strategy,restingGroups,signalIdByAsset);
+    await evaluateVirtualEntries(strategy);
     if(snapshots.rows.length)await advanceCursor(timestampIso(snapshots.rows.at(-1)!.closed_at));
     await recordHealth("signal-engine",true);
   }catch(error){await recordHealth("signal-engine",false,error,true);}

@@ -116,14 +116,15 @@ async function answer(command:CommandName):Promise<string>{
     })));
   }
   if(command==="/orders"){
-    const rows=await query<{code:string;direction:string;entry_price:string;market_price:string|null;atr:string|null;sources:string[]|null;stop_loss:string;take_profit:string;minutes:string}>(
-      `SELECT a.code,o.direction,o.entry_price,o.stop_loss,o.take_profit,
+    const rows=await query<{code:string;direction:string;entry_price:string;market_price:string|null;atr:string|null;sources:string[]|null;stop_loss:string;take_profit:string;minutes:string;awaiting_trigger:boolean;trigger_touched_at:string|null}>(
+      `SELECT a.code,o.direction,o.entry_price,o.stop_loss,o.take_profit,o.awaiting_trigger,o.trigger_touched_at,
         i.price market_price,(o.entry_provenance->>'atr1h') atr,
         ARRAY(SELECT jsonb_array_elements_text(coalesce(o.entry_provenance->'sources','[]'::jsonb))) sources,
         (extract(epoch FROM (now()-o.created_at))/60)::text minutes
        FROM orders o JOIN assets a ON a.id=o.asset_id
        LEFT JOIN LATERAL (SELECT price FROM indicator_snapshots s WHERE s.asset_id=o.asset_id ORDER BY closed_at DESC LIMIT 1) i ON true
-       WHERE o.state='PENDING_ENTRY' ORDER BY o.created_at`);
+       WHERE o.entry_kind='RESTING_LIMIT' AND (o.state='PENDING_ENTRY' OR (o.state='CREATED_LOCAL' AND o.awaiting_trigger))
+       ORDER BY o.awaiting_trigger DESC,o.created_at`);
     return formatWorkingOrders(rows.rows.map((row)=>{
       const level=Number(row.entry_price),market=row.market_price===null?null:Number(row.market_price),atr=Number(row.atr);
       const risk=Math.abs(level-Number(row.stop_loss));
@@ -131,7 +132,8 @@ async function answer(command:CommandName):Promise<string>{
         code:row.code,direction:row.direction,level,marketPrice:market,
         distanceAtr:market===null||!(atr>0)?null:Math.abs(market-level)/atr,
         expectedRiskReward:risk>0?Math.abs(Number(row.take_profit)-level)/risk:null,
-        sources:row.sources??[],ageMinutes:Number(row.minutes)
+        sources:row.sources??[],ageMinutes:Number(row.minutes),
+        awaitingTrigger:Boolean(row.awaiting_trigger),touched:row.trigger_touched_at!==null
       };
     }));
   }
