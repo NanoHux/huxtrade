@@ -1,16 +1,17 @@
 import { getConfig } from "@huxtrade/config";
 import { claimRestartRequest,pool,query,recordBusinessError,recordHealth } from "@huxtrade/database";
-import { CoinGlassFreeWebClient,type CoinGlassHeatmapRange } from "@huxtrade/exchange-clients";
+import { parseCoinGlassHeatmapUrl,type CoinGlassHeatmapRange } from "@huxtrade/exchange-clients";
+import { CoinGlassBrowserClient } from "./browser-capture.js";
 
 const config=getConfig();
-const collector=new CoinGlassFreeWebClient(undefined,undefined,undefined,config.COINGLASS_OBE,config.COINGLASS_BROWSER_HEADERS_B64);
+const collector=new CoinGlassBrowserClient(config);
 const sleep=(ms:number)=>new Promise((resolve)=>setTimeout(resolve,ms));
 const lastAssetFailures=new Map<string,string>();
-const sessionRejectedAssets=new Set<string>();
 let stopping=false;
 const heatmapRanges=new Set<CoinGlassHeatmapRange>(["12h","24h","3d","7d","30d"]);
 
 type RefreshRequest={requestId:string;requestedAt:string;closedAt:string;heatmapRange:CoinGlassHeatmapRange};
+type ProbeRequest={requestId:string;requestedAt:string;sourceUrl:string;range:CoinGlassHeatmapRange};
 
 const unresolvedFailures=await query<{asset_id:string;message:string}>(`SELECT DISTINCT ON(e.asset_id) e.asset_id::text,e.message
   FROM business_errors e
@@ -35,18 +36,53 @@ async function pendingRefreshRequest():Promise<RefreshRequest|undefined>{
   return value as RefreshRequest;
 }
 
+// Asset creation (§4.2) and the settings "test connection" action both need a
+// one-off capture of an arbitrary URL, synchronously, from apps/api's Docker
+// container which cannot reach the operator's Chrome itself. They hand the
+// job to this natively-running agent through the same Postgres app_state
+// request/result handshake the scheduled refresh already uses.
+async function pendingProbeRequest():Promise<ProbeRequest|undefined>{
+  const [request,result]=await Promise.all([
+    query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='coinglass_probe_request'"),
+    query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='coinglass_probe_result'")
+  ]);
+  const value=request.rows[0]?.value;
+  if(!value||typeof value.requestId!=="string"||typeof value.requestedAt!=="string"||typeof value.sourceUrl!=="string"||typeof value.range!=="string"||!heatmapRanges.has(value.range as CoinGlassHeatmapRange))return undefined;
+  if(result.rows[0]?.value.requestId===value.requestId)return undefined;
+  return value as ProbeRequest;
+}
+
+async function handleProbe(request:ProbeRequest){
+  try{
+    parseCoinGlassHeatmapUrl(request.sourceUrl);
+    const result=await collector.capture(request.sourceUrl,request.range);
+    await query(`INSERT INTO app_state(key,value) VALUES('coinglass_probe_result',$1)
+      ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,[JSON.stringify({
+      requestId:request.requestId,ok:true,sourceUrl:result.sourceUrl,capturedAt:result.capturedAt.toISOString(),regions:result.regions,raw:result.raw
+    })]);
+  }catch(error){
+    await query(`INSERT INTO app_state(key,value) VALUES('coinglass_probe_result',$1)
+      ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,[JSON.stringify({
+      requestId:request.requestId,ok:false,error:error instanceof Error?error.message:String(error)
+    })]);
+  }
+}
+
 async function scan(request?:RefreshRequest){
   const strategy=(await query<{heatmap_range:CoinGlassHeatmapRange}>("SELECT heatmap_range FROM strategies WHERE enabled=true LIMIT 1")).rows[0];
   const range=request?.heatmapRange??strategy?.heatmap_range??"24h";
   const assets=await query<{id:string;code:string;coinglass_url:string;captured_at:string|null}>(`SELECT a.id,a.code,a.coinglass_url,h.captured_at::text
     FROM assets a LEFT JOIN coinglass_heatmaps h ON h.asset_id=a.id AND h.heatmap_range=$1
     WHERE a.collect_enabled=true ORDER BY a.code`,[range]);
-  let succeeded=0,fresh=0;
+  let succeeded=0,fresh=0,captured=0;
   for(const asset of assets.rows){
     if(stopping)break;
     const age=asset.captured_at?Date.now()-new Date(asset.captured_at).getTime():Infinity;
     if(!request&&age<config.COINGLASS_REFRESH_MS){fresh+=1;continue;}
-    if(sessionRejectedAssets.has(asset.id))continue;
+    // Back-to-back full-page navigations of a heavy ECharts/WebGL heatmap
+    // with no pause between them has crashed the Chrome renderer in practice.
+    if(captured>0)await sleep(config.COINGLASS_CAPTURE_DELAY_MS);
+    captured+=1;
     try{
       const result=await collector.capture(asset.coinglass_url,range);
       await query(`INSERT INTO coinglass_heatmaps(asset_id,heatmap_range,source_url,captured_at,regions,raw)
@@ -55,7 +91,6 @@ async function scan(request?:RefreshRequest){
         asset.id,range,result.sourceUrl,result.capturedAt,JSON.stringify(result.regions),JSON.stringify(result.raw)
       ]);
       lastAssetFailures.delete(asset.id);
-      sessionRejectedAssets.delete(asset.id);
       succeeded+=1;
     }catch(error){
       const message=error instanceof Error?error.message:String(error);
@@ -63,10 +98,6 @@ async function scan(request?:RefreshRequest){
         await recordBusinessError({service:"coinglass-agent",assetId:asset.id,code:"COINGLASS_HEATMAP_CAPTURE_FAILED",message,blocksTrading:true,context:{code:asset.code,range,sourceUrl:asset.coinglass_url}});
         lastAssetFailures.set(asset.id,message);
       }
-      // A 40000 response is the free web session gate. The obe token is bound
-      // to the browser fingerprint imported with the HAR, so retrying the same
-      // rejected pair on every poll cannot recover without a new import.
-      if(/rejected request \(40000(?:\:|\))/.test(message))sessionRejectedAssets.add(asset.id);
     }
   }
   const missing=assets.rows.length-(fresh+succeeded);
@@ -81,19 +112,23 @@ async function scan(request?:RefreshRequest){
 while(!stopping){
   // The backend can rewrite the session header and ask for a restart; exiting
   // lets the supervisor reload .env instead of running on a stale credential.
-  if(await claimRestartRequest("coinglass-agent")){await pool.end();process.exit(0);}
-  if(config.COINGLASS_ADAPTER_MODE!=="free-web"){
+  if(await claimRestartRequest("coinglass-agent")){await collector.close();await pool.end();process.exit(0);}
+  if(config.COINGLASS_ADAPTER_MODE!=="browser"){
     // Fail visible, not fatal: a crash loop would never report health and would
     // make the credential-restart verification in the API look like a failure.
-    await setSession(false,"COINGLASS_ADAPTER_MODE is not free-web");
-    await recordHealth("coinglass-agent",false,"COINGLASS_ADAPTER_MODE is not free-web; configure the session in 系统设置",true,false);
+    await setSession(false,"COINGLASS_ADAPTER_MODE is not browser");
+    await recordHealth("coinglass-agent",false,"COINGLASS_ADAPTER_MODE is not browser; configure the session in 系统设置",true,false);
     await sleep(config.COINGLASS_AGENT_POLL_MS);
     continue;
   }
-  try{await scan(await pendingRefreshRequest());}catch(error){await setSession(false,error instanceof Error?error.message:String(error));await recordHealth("coinglass-agent",false,error,true);}
+  try{
+    const probe=await pendingProbeRequest();
+    if(probe)await handleProbe(probe);
+    await scan(await pendingRefreshRequest());
+  }catch(error){await setSession(false,error instanceof Error?error.message:String(error));await recordHealth("coinglass-agent",false,error,true);}
   if(!stopping)await sleep(config.COINGLASS_AGENT_POLL_MS);
 }
 
-async function shutdown(){stopping=true;await pool.end();}
+async function shutdown(){stopping=true;await collector.close();await pool.end();}
 process.on("SIGINT",()=>{void shutdown();});
 process.on("SIGTERM",()=>{void shutdown();});

@@ -18,28 +18,17 @@ function findEnvFile(){
 }
 const envFilePath=findEnvFile();
 dotenv.config({path:envFilePath,override:process.env.ENV_FILE_OVERRIDE!=="false"});
+// Anything that edits secrets on disk (API settings routes) must write to
+// this exact resolved path, not re-derive it from cwd/ENV_FILE_PATH — pnpm's
+// filtered `start` scripts chdir into the package directory, so a fresh
+// resolve(".env") silently lands on a different, non-bind-mounted file.
+export function getEnvFilePath(){return envFilePath;}
 
 export function resolveConfiguredPath(value:string,sourceEnvFile=envFilePath){
   return resolve(dirname(sourceEnvFile),value);
 }
 
 const bool = z.enum(["true", "false"]).default("false").transform((v) => v === "true");
-const coinGlassBrowserHeaders=z.string().default("").transform((value,context)=>{
-  const allowed=new Set(["accept-language","priority","sec-ch-ua","sec-ch-ua-mobile","sec-ch-ua-platform","sec-fetch-dest","sec-fetch-mode","sec-fetch-site","user-agent"]);
-  try{
-    const parsed=JSON.parse(value?Buffer.from(value,"base64url").toString("utf8"):"{}") as unknown;
-    if(!parsed||typeof parsed!=="object"||Array.isArray(parsed))throw new Error("must be a JSON object");
-    const result:Record<string,string>={};
-    for(const [name,headerValue] of Object.entries(parsed)){
-      if(!allowed.has(name)||typeof headerValue!=="string"||headerValue.length>1024||/[\r\n]/.test(headerValue))throw new Error(`invalid browser header ${name}`);
-      result[name]=headerValue;
-    }
-    return result;
-  }catch(error){
-    context.addIssue({code:"custom",message:`Invalid COINGLASS_BROWSER_HEADERS_B64: ${error instanceof Error?error.message:String(error)}`});
-    return z.NEVER;
-  }
-});
 const schema = z.object({
   NODE_ENV: z.enum(["development", "test", "production"]).default("development"),
   DATABASE_URL: z.string().default("postgres://huxtrade:huxtrade@localhost:5432/huxtrade"),
@@ -47,11 +36,13 @@ const schema = z.object({
   API_PORT: z.coerce.number().int().positive().default(4000),
   WEB_ORIGIN: z.string().default("http://localhost:3000"),
   BINANCE_FUTURES_BASE_URL: z.string().url().default("https://fapi.binance.com"),
-  COINGLASS_ADAPTER_MODE: z.enum(["disabled","free-web"]).default("disabled"),
-  COINGLASS_OBE: z.string().default(""),
-  COINGLASS_BROWSER_HEADERS_B64: coinGlassBrowserHeaders,
+  COINGLASS_ADAPTER_MODE: z.enum(["disabled","browser"]).default("disabled"),
+  COINGLASS_PROFILE_PATH: z.string().default("./coinglass-profile"),
+  COINGLASS_BROWSER_EXECUTABLE: z.string().default(""),
+  COINGLASS_CDP_URL: z.string().default(""),
   COINGLASS_AGENT_POLL_MS: z.coerce.number().int().min(5_000).default(15_000),
   COINGLASS_REFRESH_MS: z.coerce.number().int().min(60_000).default(10*60_000),
+  COINGLASS_CAPTURE_DELAY_MS: z.coerce.number().int().min(0).default(2_000),
   VARIATIONAL_BASE_URL: z.string().default(""),
   VARIATIONAL_PROFILE_PATH: z.string().default("./playwright-profile"),
   VARIATIONAL_BROWSER_EXECUTABLE: z.string().default(""),
@@ -63,6 +54,12 @@ const schema = z.object({
   VARIATIONAL_PROTECTION_SLIPPAGE: z.coerce.number().min(0).max(0.1).default(0.03),
   VARIATIONAL_CLOSE_SLIPPAGE: z.coerce.number().min(0).max(0.1).default(0.01),
   LIVE_TRADING_ENABLED: bool,
+  // Shadow is the default and must stay that way until the resting model has
+  // its own track record: it computes every decision and writes every
+  // entry_plans row, but emits no outbox message, so the live path is written
+  // and wired yet electrically dead. Flipping to `live` is the rollout step,
+  // and flipping back is the whole rollback plan.
+  STRATEGY_EXECUTION_MODE: z.enum(["shadow","live"]).default("shadow"),
   TELEGRAM_BOT_TOKEN: z.string().default(""),
   TELEGRAM_CHAT_ID: z.string().default(""),
   DEFAULT_MARGIN_USDC: z.coerce.number().min(1).default(10),
@@ -78,7 +75,7 @@ let cached: AppConfig | undefined;
 export function getConfig(): AppConfig {
   if(!cached){
     const parsed=schema.parse(process.env);
-    cached={...parsed,VARIATIONAL_PROFILE_PATH:resolveConfiguredPath(parsed.VARIATIONAL_PROFILE_PATH),VARIATIONAL_DISCOVERY_OUTPUT:resolveConfiguredPath(parsed.VARIATIONAL_DISCOVERY_OUTPUT)};
+    cached={...parsed,VARIATIONAL_PROFILE_PATH:resolveConfiguredPath(parsed.VARIATIONAL_PROFILE_PATH),VARIATIONAL_DISCOVERY_OUTPUT:resolveConfiguredPath(parsed.VARIATIONAL_DISCOVERY_OUTPUT),COINGLASS_PROFILE_PATH:resolveConfiguredPath(parsed.COINGLASS_PROFILE_PATH)};
   }
   if (cached.MARGIN_RESUME_PERCENT >= cached.MARGIN_PAUSE_PERCENT) {
     throw new Error("MARGIN_RESUME_PERCENT must be lower than MARGIN_PAUSE_PERCENT");
@@ -89,6 +86,10 @@ export function getConfig(): AppConfig {
     const url=new URL(cached.VARIATIONAL_CDP_URL);
     if(!["127.0.0.1","localhost","::1"].includes(url.hostname))throw new Error("VARIATIONAL_CDP_URL must use a loopback host");
   }
+  if(cached.COINGLASS_CDP_URL){
+    const url=new URL(cached.COINGLASS_CDP_URL);
+    if(!["127.0.0.1","localhost","::1"].includes(url.hostname))throw new Error("COINGLASS_CDP_URL must use a loopback host");
+  }
   return cached;
 }
 
@@ -97,9 +98,152 @@ export const fixedRules = Object.freeze({
   binanceStaleMs: 5 * 60_000,
   heatmapStaleMs: 30 * 60_000,
   robustZThreshold: 1,
-  minimumRiskReward: 1.5,
+  // The reward/risk floor an order must clear to be worth placing. There is no
+  // fallback beneath it: a signal whose structure cannot pay 1.4 times its own
+  // stop distance is not traded at all, rather than traded on a stop invented
+  // from the margin size.
+  minimumRiskReward: 1.4,
+  // A CAP on where the target may sit, not a filter that refuses the trade.
+  // Replaying the 2026-08-07..09 plan ledger (231 plans, 84 fills, 67
+  // resolved) against 1m bars, the hit rate falls apart as the planned ratio
+  // rises: 1.4-1.8 hit 14% of the time, 2.5-4.0 hit 11%, and 4.0+ hit 0 times
+  // in 25 trades. A ratio that high is not a better trade, it is a target
+  // parked on a liquidation peak price never reaches — so the answer is to
+  // bring the target in to 4R and take the trade, not to throw the setup away.
+  // The same price also stands in as the objective when there is no zone
+  // ahead at all, which is a runaway move rather than a reason to refuse.
+  maximumRiskReward: 4,
   stopAtrBuffer: 0.5,
   takeProfitAtrOffset: 0.15,
+  // A zone standing between the entry and the objective is only treated as a
+  // real obstacle once it reaches this share of the objective's own intensity.
+  // Below it the cluster is assumed to be run through — the direction call
+  // said price is going that way, and a thin band of liquidations is what such
+  // a move consumes on the way. At or above it the move is assumed to stall
+  // there instead, so it becomes the objective and the ratio is measured
+  // against it. Evaluated exactly once: the demoted objective is not itself
+  // re-scanned for obstacles, which would recurse without a natural end.
+  // 0.7 rather than 0.6: replaying 750 armed scans, raising it to 0.7 turned
+  // 11% more of them into placeable plans and lifted the median ratio from
+  // 4.48 to 4.77, because fewer mid-sized clusters demote the objective away
+  // from the real peak. That gain is an assumption, not a discovery — every
+  // extra plan is one that expects price to run through a cluster the old
+  // threshold respected — so it is worth revisiting once enough trades have
+  // reached their own target or stop to say whether the assumption holds.
+  falsePeakIntensityRatio: 0.7,
+  // Never settable: the per-asset stacking cap is a spec red line, not a
+  // tuning knob. Variational nets an instrument into one aggregate position
+  // with one auto-resizing TP/SL, so a second same-direction order shares the
+  // first one's stop and both die together.
+  maxWorkingOrdersPerAsset: 1,
+  // Defaults for the resting limit entry model. Every knob the entry-band /
+  // confluence / hysteresis algorithm reads lives here, so none of it can
+  // drift into a hardcoded literal at a call site — and each is overridable
+  // per strategy through strategies.resting_entry, so tuning never needs a
+  // redeploy. resolveRestingEntry() in strategy-engine merges the two.
+  restingEntry: Object.freeze({
+    // Entry band, in 1h ATR from the scan's reference price. Nearer than
+    // `min` there is no execution advantage over just taking the market;
+    // farther than `max` the order would rarely fill and would be leaning on
+    // structure that has gone stale by the time price gets there.
+    entryBandAtrMin: 0.3,
+    entryBandAtrMax: 2.5,
+    // The order sits *in front of* the structure it leans on, never inside
+    // it: the liquidation sweep is what triggers the reversal, so the fill
+    // has to happen before price reaches the zone's near edge.
+    entryOffsetAtr: 0.1,
+    confluenceMergeAtr: 0.35,
+    // Hysteresis band. Below this the working order is left alone — churning
+    // the same level every 15 minutes costs cancel/replace round-trips and
+    // loses queue position for no structural reason.
+    replaceThresholdAtr: 0.25,
+    biasPersistenceScans: 4,
+    // A single counter-signal is not a reversal. Flipping on one 15m bar used
+    // a signal noisier than the stop-loss to overrule the stop-loss: an armed
+    // BTC bias reversed six times in five hours, and each reversal after a
+    // fill market-closed a position that still had its own defined risk. A
+    // flip now has to be asserted this many times, with no intervening
+    // confirmation of the original direction, before anything is acted on.
+    flipConfirmationScans: 2,
+    // Every tracked asset may arm at once. If Phase 0 P0-2 shows that resting
+    // orders lock initial margin, lowering this is the lever that stops the
+    // account parking its whole margin in orders that never fill.
+    maxArmedAssets: 15,
+    // Heatmap candidates score on the region's `percentile`, which
+    // eligibleHeatmapRegions already normalises to 0..1. Raw `intensity` is
+    // an absolute Coinglass number whose scale differs per asset and per
+    // range, so it could never be compared against a fixed swing/EMA weight
+    // or summed with one at a confluence.
+    swingScore: 0.55,
+    emaScore: 0.3,
+    // Incumbency. Without it the selection is winner-take-all, so two clusters
+    // whose scores differ by a hair — and whose prices differ by more than a
+    // full ATR — trade places whenever one of them drifts across the entry
+    // band's far edge, teleporting the working order back and forth. The
+    // replace hysteresis cannot damp that: it measures price distance, and the
+    // two candidates are genuinely far apart. This makes the sitting structure
+    // defend its place instead.
+    incumbentScoreBonus: 0.5,
+    // Refuses to trade WITH a move that has already run, in either direction.
+    //
+    // Selling pressure inside a strong advance is profit-taking, not a turn.
+    // Replaying seven days across ten assets, SHORT signals on something
+    // already up 10%+ over 24h averaged -4.66% against the position in the
+    // following hour and won 27.6% of the time, against -0.11% and 45.6% on
+    // quiet assets — the same signal inverted, not merely weakened. Every
+    // stop-out in the first week was a short, three of them into 24h gains of
+    // 8%, 12% and 38%. The threshold sits above the measured 10% so it only
+    // refuses the extreme case rather than most of one side.
+    //
+    // The long side is now filtered on the same threshold by operator
+    // decision. Stated plainly: the mirror case was measured on only 14
+    // observations, which is not evidence, so this half rests on the symmetry
+    // argument rather than on data — worth revisiting once enough longs into
+    // 15% dumps have resolved to measure it directly.
+    extremeMoveBlockPercent: 15,
+    // Same-direction circuit breaker. Three stop-outs one way inside a few
+    // hours is the signature of a regime the model is reading backwards, not
+    // of three independent unlucky trades: on 2026-08-08 four shorts stopped
+    // out between 18:58 and 22:14 for -157 USDC, and halting after the third
+    // would have prevented the last of them. Halting only stops that
+    // direction ARMING; positions keep their own stop and target, and working
+    // orders drain naturally as their bias expires.
+    lossStreakCount: 3,
+    lossStreakWindowHours: 6,
+    lossStreakHaltHours: 12,
+    // Scale-out. Of 67 resolved trades in the 2026-08-07..09 replay, 61%
+    // reached +0.6R of unrealised profit and 72% reached +0.5R, yet only 12%
+    // ever reached their target: the dominant outcome is a position that goes
+    // meaningfully green and then gives all of it back plus the stop. Taking
+    // part of the position off at this level and moving the rest's stop to
+    // breakeven moves per-trade expectancy from -0.691R to about 0.00R.
+    //
+    // Two honest caveats live with these numbers. The excursion is measured on
+    // 1m bar highs, so some of it was never transactable — the live trigger
+    // reads the venue's own mark price instead, and will therefore fire less
+    // often than the replay implies. And the replay's optimum keeps sliding
+    // toward "exit sooner, exit more", whose limit is not trading at all; 0.5R
+    // is chosen as the point where the excursion distribution is still dense
+    // (72%) rather than as the peak of a curve fitted to 67 samples.
+    scaleOutTriggerR: 0.5,
+    scaleOutFraction: 0.5,
+    // Below this stop width the scale-out is skipped entirely. TRUMP's stop
+    // was 0.41% of price, which puts 0.5R at 0.2% — the spread paid to close
+    // half at market on an RFQ venue eats a large share of that, so the
+    // round trip stops being worth its own execution cost.
+    scaleOutMinStopPercent: 0.8,
+    // The breakeven stop is set this fraction of a stop-width *beyond* entry,
+    // in the position's favour, so the exit still clears the spread rather
+    // than scratching at exactly the entry price and paying to get out.
+    breakevenOffsetR: 0.05
+  }),
+  // Whitelist size. Every asset costs one CoinGlass heatmap capture and one
+  // Binance round trip per 15-minute scan, which is the real constraint — the
+  // capture agent already reports occasional misses at 28 assets. Raised from
+  // 50 because assets with trading history cannot be deleted (that would take
+  // their orders and signals with them), so retired ones accumulate against
+  // the cap forever and the ceiling was being spent on tickers nobody trades.
+  maxAssets: 120,
   variationalPollMs: 30_000,
   telegramRetryMs: 10_000,
   telegramMaxAttempts: 3,

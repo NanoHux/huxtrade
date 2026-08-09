@@ -1,7 +1,5 @@
-import { createCipheriv } from "node:crypto";
-import { gzipSync } from "node:zlib";
 import { afterEach,describe,expect,it,vi } from "vitest";
-import { BinanceFuturesClient,buildCoinGlassHeatmapPageUrl,CoinGlassFreeWebClient,normalizeCoinGlassWebHeatmap,parseCoinGlassHeatmapUrl } from "./index.js";
+import { BinanceFuturesClient,buildCoinGlassHeatmapPageUrl,normalizeCoinGlassWebHeatmap,parseCoinGlassHeatmapUrl,variationalUnderlying } from "./index.js";
 
 const trade=(id:number,time:number)=>({a:id,p:"100",q:"1",T:time,m:false});
 
@@ -27,11 +25,6 @@ describe("Binance futures client",()=>{
 });
 
 describe("CoinGlass free web Heatmap",()=>{
-  const encrypt=(text:string,key:string)=>{
-    const cipher=createCipheriv("aes-128-ecb",Buffer.from(key),null);
-    return Buffer.concat([cipher.update(gzipSync(Buffer.from(text))),cipher.final()]).toString("base64");
-  };
-
   it("validates and normalizes the operator-provided pair URL",()=>{
     expect(parseCoinGlassHeatmapUrl("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=sol&type=pair")).toMatchObject({coin:"SOL",symbol:"Binance_SOLUSDT"});
     expect(buildCoinGlassHeatmapPageUrl("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=SOL&type=pair","7d")).toContain("time=w1");
@@ -52,38 +45,40 @@ describe("CoinGlass free web Heatmap",()=>{
     expect(()=>normalizeCoinGlassWebHeatmap({code:"40000",msg:"40000"})).toThrow(/rejected/);
     expect(()=>normalizeCoinGlassWebHeatmap({code:"0",data:{y:[1],prices:[],liq:[]}})).toThrow(/no liquidation regions/);
   });
+});
 
-  it("reproduces and decrypts the free web request without cookies",async()=>{
-    const now=1_785_904_874_290;
-    const firstKey=Buffer.from(String(now)).toString("base64").slice(0,16);
-    const sessionKey="d663d1901f9e4975";
-    const raw={y:[99,100,101],prices:Array.from({length:288},()=>[1,2,3,4]),liq:[[0,1,2],[1,1,3],[1,2,10]] as Array<[number,number,number]>};
-    const request=vi.fn(async(input:URL|RequestInfo,init?:RequestInit)=>{
-      const url=new URL(String(input));
-      expect(url.searchParams.get("symbol")).toBe("Binance_BTCUSDT");
-      expect(url.searchParams.get("interval")).toBe("5");
-      expect(url.searchParams.get("limit")).toBe("288");
-      expect(url.searchParams.get("data")).toMatch(/^[A-Za-z0-9+/]+=*$/);
-      const headers=new Headers(init?.headers);
-      expect(headers.get("encryption")).toBe("true");
-      expect(headers.get("cache-ts-v2")).toBe(String(now));
-      expect(headers.has("cookie")).toBe(false);
-      expect(headers.get("user-agent")).toBe("CoinGlass-HAR-UA");
-      expect(headers.get("sec-ch-ua")).toBe('"Chromium";v="150"');
-      return new Response(JSON.stringify({code:"0",msg:"success",success:true,data:encrypt(JSON.stringify(raw),sessionKey)}),{status:200,headers:{
-        encryption:"true",v:"0",user:encrypt(sessionKey,firstKey)
-      }});
-    });
-    const result=await new CoinGlassFreeWebClient("https://capi.coinglass.com",request as typeof fetch,()=>now,"",{
-      "user-agent":"CoinGlass-HAR-UA","sec-ch-ua":'"Chromium";v="150"'
-    }).capture("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC&type=pair","24h");
-    expect(request).toHaveBeenCalledOnce();
-    expect(result.raw!.liq).toHaveLength(3);
-    expect(result.regions[0]).toMatchObject({price:101,intensity:10,rank:1});
+describe("Variational venue symbols",()=>{
+  it("takes the ticker from the operator's URL, not from the Binance symbol",()=>{
+    // The bug this exists for: LIT trades as LIGHTER, and "LIT" was rejected
+    // with {"error_message":"asset: Asset not supported"} on every submission.
+    expect(variationalUnderlying("https://omni.variational.io/perpetual/LIGHTER","LITUSDT")).toBe("LIGHTER");
+    expect(variationalUnderlying("https://omni.variational.io/perpetual/AAVE","AAVEUSDT")).toBe("AAVE");
+    // Lower-case market paths and a stray leading space both occur in real rows.
+    expect(variationalUnderlying("https://trade.variational.io/markets/btc","BTCUSDT")).toBe("BTC");
+    expect(variationalUnderlying(" https://omni.variational.io/perpetual/ZEC ","ZECUSDT")).toBe("ZEC");
   });
 
-  it("fails closed when CoinGlass changes the response encryption version",async()=>{
-    const request=vi.fn(async()=>new Response(JSON.stringify({code:"0",data:"encrypted"}),{headers:{encryption:"true",v:"2",user:"key"}}));
-    await expect(new CoinGlassFreeWebClient("https://capi.coinglass.com",request as typeof fetch).capture("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC&type=pair","24h")).rejects.toThrow(/unsupported encryption version/);
+  it("falls back to the Binance base when the URL cannot say",()=>{
+    expect(variationalUnderlying(null,"SOLUSDT")).toBe("SOL");
+    expect(variationalUnderlying("","ETHUSDT")).toBe("ETH");
+    expect(variationalUnderlying("not a url","DOGEUSDT")).toBe("DOGE");
+    expect(variationalUnderlying("https://omni.variational.io/","XPLUSDT")).toBe("XPL");
+    // A path segment that is not a plausible ticker is ignored rather than trusted.
+    expect(variationalUnderlying("https://omni.variational.io/perpetual/a-very-long-slug-here","UNIUSDT")).toBe("UNI");
+  });
+});
+
+describe("single-character tickers",()=>{
+  it("accepts a one-character coin, which is a real ticker and not a typo",()=>{
+    // "4" trades as 4USDT; a two-character minimum rejected the whole asset
+    // with an unexplained VALIDATION_ERROR.
+    expect(parseCoinGlassHeatmapUrl("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=4&type=pair"))
+      .toMatchObject({coin:"4",symbol:"Binance_4USDT"});
+    expect(variationalUnderlying("https://omni.variational.io/perpetual/4","4USDT")).toBe("4");
+  });
+
+  it("still rejects a coin parameter that is not a ticker at all",()=>{
+    expect(()=>parseCoinGlassHeatmapUrl("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=&type=pair")).toThrow(/invalid coin/);
+    expect(()=>parseCoinGlassHeatmapUrl("https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC-PERP&type=pair")).toThrow(/invalid coin/);
   });
 });

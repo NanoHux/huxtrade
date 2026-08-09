@@ -3,7 +3,11 @@ node_modules/
 dist/
 coverage/
 .env
-.env.local
+# Every .env variant, not just the two that were listed: two timestamped
+# backups (.env.bak-before-resting, .env.bak-before-slippage) slipped past
+# the old rules carrying POSTGRES_PASSWORD and TELEGRAM_BOT_TOKEN.
+.env.*
+!.env.example
 .pnpm-store/
 playwright-profile/
 coinglass-profile/

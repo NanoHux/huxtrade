@@ -1,20 +1,30 @@
 import { chmod,readFile,writeFile } from "node:fs/promises";
-import { resolve } from "node:path";
+import { randomUUID } from "node:crypto";
 import Fastify from "fastify";
 import cors from "@fastify/cors";
 import { z } from "zod";
-import { fixedRules, getConfig } from "@huxtrade/config";
+import { fixedRules, getConfig, getEnvFilePath } from "@huxtrade/config";
 import { pool, query, recordBusinessError, recordHealth, transaction } from "@huxtrade/database";
-import { BinanceFuturesClient,CoinGlassFreeWebClient,coinGlassBrowserHeaderNames,parseCoinGlassHeatmapUrl } from "@huxtrade/exchange-clients";
+import { BinanceFuturesClient,parseCoinGlassHeatmapUrl } from "@huxtrade/exchange-clients";
 import { openOrderStates } from "@huxtrade/shared-types";
+import { resolveRestingEntry } from "@huxtrade/strategy-engine";
 
 const config = getConfig();
-const app = Fastify({ logger: { redact: ["req.headers.authorization", "body.botToken", "body.apiKey", "body.obe"] } });
-await app.register(cors, { origin: config.WEB_ORIGIN });
+const app = Fastify({ logger: { redact: ["req.headers.authorization", "body.botToken", "body.apiKey"] } });
+// Spec 12.1: MacBook-only access, not a public multi-origin policy. Browsers
+// treat localhost and 127.0.0.1 as different origins even though they're the
+// same machine, so accept whichever the operator's browser happens to use.
+const webOriginUrl=new URL(config.WEB_ORIGIN);
+const allowedWebOrigins=new Set([config.WEB_ORIGIN,`${webOriginUrl.protocol}//127.0.0.1:${webOriginUrl.port}`,`${webOriginUrl.protocol}//localhost:${webOriginUrl.port}`]);
+await app.register(cors, { origin: (origin,callback)=>{callback(null,!origin||allowedWebOrigins.has(origin));}, methods:["GET","POST","PATCH","PUT","DELETE"] });
 const binance = new BinanceFuturesClient();
-let coinGlassObe=config.COINGLASS_OBE;
-let coinGlassBrowserHeaders:Record<string,string>={...config.COINGLASS_BROWSER_HEADERS_B64};
-let coinGlass = new CoinGlassFreeWebClient(undefined,undefined,undefined,coinGlassObe,coinGlassBrowserHeaders);
+// api has no polling loop and never restarts itself on service.restart_requested
+// (only variational-agent needs to, to pick up the new value for enforcement),
+// so its own display of this flag must be updated directly, not left cached
+// from process start — otherwise the dashboard would show stale state forever.
+let liveTradingEnabled=config.LIVE_TRADING_ENABLED;
+let defaultMarginUsdc=config.DEFAULT_MARGIN_USDC;
+let maxMarginUsdc=config.MAX_MARGIN_USDC;
 let telegramBotToken=config.TELEGRAM_BOT_TOKEN;
 let telegramChatId=config.TELEGRAM_CHAT_ID;
 let telegramConfigured=Boolean(config.TELEGRAM_BOT_TOKEN&&config.TELEGRAM_CHAT_ID);
@@ -22,7 +32,7 @@ let telegramConfigured=Boolean(config.TELEGRAM_BOT_TOKEN&&config.TELEGRAM_CHAT_I
 const restartDeadlineMs=90_000;
 
 async function writeEnvValues(values:Record<string,string>){
-  const path=resolve(process.env.ENV_FILE_PATH??".env");let content="";try{content=await readFile(path,"utf8");}catch{}
+  const path=getEnvFilePath();let content="";try{content=await readFile(path,"utf8");}catch{}
   for(const [key,value] of Object.entries(values)){
     const line=`${key}=${JSON.stringify(value)}`;
     const pattern=new RegExp(`^${key}=.*$`,"m");content=pattern.test(content)?content.replace(pattern,line):`${content.trimEnd()}\n${line}\n`;
@@ -71,22 +81,60 @@ async function sendTelegramTest(botToken:string,chatId:string,text:string){
   const controller=new AbortController();const timer=setTimeout(()=>controller.abort(),12_000);
   try{
     const response=await fetch(`https://api.telegram.org/bot${botToken}/sendMessage`,{method:"POST",signal:controller.signal,headers:{"content-type":"application/json"},body:JSON.stringify({chat_id:chatId,text})});
-    if(!response.ok)throw new Error(`Telegram HTTP ${response.status}`);
+    if(!response.ok){
+      const body=await response.json().catch(()=>({description:undefined}));
+      throw new Error(body.description??`Telegram HTTP ${response.status}`);
+    }
   }finally{clearTimeout(timer);}
 }
 
 const assetInput = z.object({
-  code: z.string().trim().min(2).max(15).transform((x) => x.toUpperCase()),
+  // One character is a legitimate ticker — "4" trades as 4USDT — and the old
+  // two-character minimum rejected it with a bare VALIDATION_ERROR.
+  code: z.string().trim().min(1).max(15).transform((x) => x.toUpperCase()),
   binanceSymbol: z.string().trim().min(5).transform((x) => x.toUpperCase()),
   coinglassUrl: z.string().url(),
   variationalUrl: z.string().url(),
   collectEnabled: z.boolean().default(true), signalEnabled: z.boolean().default(true), tradeEnabled: z.boolean().default(false)
 });
+// Resting limit entry parameters. The bounds are deliberately narrower than
+// "any positive number": these are ATR multiples and scan counts whose sane
+// range is known, and a typo here would not error — it would quietly stop the
+// model from ever finding a candidate.
+const restingEntryInput = z.object({
+  entryBandAtrMin: z.number().min(0.05).max(3),
+  entryBandAtrMax: z.number().min(0.2).max(8),
+  entryOffsetAtr: z.number().min(0).max(1),
+  confluenceMergeAtr: z.number().min(0.05).max(2),
+  replaceThresholdAtr: z.number().min(0.05).max(2),
+  biasPersistenceScans: z.number().int().min(1).max(96),
+  flipConfirmationScans: z.number().int().min(1).max(12),
+  maxArmedAssets: z.number().int().min(1).max(fixedRules.maxAssets),
+  swingScore: z.number().min(0.01).max(5),
+  emaScore: z.number().min(0.01).max(5),
+  incumbentScoreBonus: z.number().min(0).max(5),
+  extremeMoveBlockPercent: z.number().min(0).max(200),
+  lossStreakCount: z.number().int().min(0).max(20),
+  lossStreakWindowHours: z.number().min(0.25).max(72),
+  lossStreakHaltHours: z.number().min(0.25).max(168),
+  scaleOutTriggerR: z.number().min(0).max(5),
+  // Capped below 1 on purpose: closing the whole position at the trigger is
+  // not a scale-out, it is a nearer take-profit that abandons the target the
+  // plan was built around. resolveRestingEntry clamps too, so a value stored
+  // before this bound existed still cannot take effect.
+  scaleOutFraction: z.number().min(0).max(0.9),
+  scaleOutMinStopPercent: z.number().min(0).max(5),
+  breakevenOffsetR: z.number().min(0).max(0.5)
+}).partial().refine((v) => v.entryBandAtrMin === undefined || v.entryBandAtrMax === undefined || v.entryBandAtrMin < v.entryBandAtrMax,
+  "entryBandAtrMin must be smaller than entryBandAtrMax");
+
 const strategyInput = z.object({
   name: z.string().trim().min(3).max(80), enabled: z.boolean().default(false),
   logic: z.enum(["AND", "N_OF_M"]), requiredCount: z.number().int().min(2).max(4).nullable().optional(),
   conditions: z.array(z.enum(["OI", "CVD", "FUNDING", "HEATMAP"])).min(2).max(4).refine((v) => new Set(v).size === v.length, "conditions must be unique"),
-  heatmapRange: z.enum(["12h", "24h", "3d", "7d", "30d"]).default("24h"), maxOrdersPerSide: z.number().int().min(1).max(20).default(5)
+  heatmapRange: z.enum(["12h", "24h", "3d", "7d", "30d"]).default("24h"), maxOrdersPerSide: z.number().int().min(1).max(20).default(5),
+  entryKind: z.enum(["MARKET_ON_SIGNAL", "RESTING_LIMIT"]).default("MARKET_ON_SIGNAL"),
+  restingEntry: restingEntryInput.default({})
 }).refine((v) => v.logic !== "N_OF_M" || (v.requiredCount! >= 2 && v.requiredCount! <= v.conditions.length), "invalid N-of-M count");
 
 const camelAsset = (r: Record<string, unknown>) => ({
@@ -97,14 +145,36 @@ const camelAsset = (r: Record<string, unknown>) => ({
   market:r.closed_at?{price:Number(r.price),oiChange1h:r.oi_change_1h==null?null:Number(r.oi_change_1h),oiZ:r.oi_z==null?null:Number(r.oi_z),oiPassed:Boolean(r.oi_passed),cvd:r.cvd_value==null?null:Number(r.cvd_value),cvdZ:r.cvd_z==null?null:Number(r.cvd_z),cvdPassed:Boolean(r.cvd_passed),funding:r.funding_value==null?null:Number(r.funding_value),fundingZ:r.funding_z==null?null:Math.max(Math.abs(Number(r.funding_z)),Math.abs(Number(r.funding_change_z??0))),fundingPassed:Boolean(r.funding_passed),heatmapPassed:Boolean(r.heatmap_passed),warmupReady:Boolean(r.warmup_ready),closedAt:r.closed_at}:undefined
 });
 
+// The API container cannot reach the operator's Chrome; it hands captures to
+// the natively-running coinglass-agent through a Postgres app_state
+// request/result handshake (mirrors the scheduled coinglass_refresh_request).
+async function requestCoinGlassCapture(sourceUrl:string,range:"12h"|"24h"|"3d"|"7d"|"30d"="24h"){
+  const requestId=randomUUID();
+  await query(`INSERT INTO app_state(key,value) VALUES('coinglass_probe_request',$1)
+    ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,[JSON.stringify({requestId,requestedAt:new Date().toISOString(),sourceUrl,range})]);
+  const deadline=Date.now()+45_000;
+  while(Date.now()<deadline){
+    await new Promise((r)=>setTimeout(r,500));
+    const row=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='coinglass_probe_result'")).rows[0]?.value;
+    if(row?.requestId===requestId){
+      if(row.ok)return {regions:row.regions as unknown[],raw:row.raw,sourceUrl:String(row.sourceUrl),capturedAt:new Date(String(row.capturedAt))};
+      throw new Error(String(row.error??"CoinGlass 采集失败"));
+    }
+  }
+  throw new Error("CoinGlass Agent 未在规定时间内响应，请确认浏览器已登录并处于运行状态（COINGLASS_ADAPTER_MODE=browser）");
+}
+
 async function captureCoinGlassHeatmap(value:string){
   const parsed=parseCoinGlassHeatmapUrl(value);
-  const captured=await coinGlass.capture(parsed.url,"24h");
+  const captured=await requestCoinGlassCapture(parsed.url,"24h");
   return {parsed,captured};
 }
 const camelStrategy = (r: Record<string, unknown>) => ({
   id:r.id, name:r.name, enabled:r.enabled, logic:r.logic, requiredCount:r.required_count, conditions:r.conditions,
-  heatmapRange:r.heatmap_range, maxOrdersPerSide:r.max_orders_per_side
+  heatmapRange:r.heatmap_range, maxOrdersPerSide:r.max_orders_per_side, entryKind:r.entry_kind,
+  // Always resolved, never the raw override object: the UI has to show the
+  // numbers the engine will actually use, including the ones nobody set.
+  restingEntry:resolveRestingEntry(r.resting_entry as Record<string,number>|null)
 });
 
 app.setErrorHandler(async(error, _request, reply) => {
@@ -163,7 +233,7 @@ app.get("/api/dashboard", async () => {
   const os = orderStats.rows[0] ?? { orders:"0", fills:"0", closed:"0", wins:"0", pnl:"0" };
   const orderCount=Number(os.orders), fills=Number(os.fills), closed=Number(os.closed), wins=Number(os.wins);
   return {
-    generatedAt:new Date().toISOString(), liveTradingEnabled:config.LIVE_TRADING_ENABLED,
+    generatedAt:new Date().toISOString(), liveTradingEnabled,
     globalPaused:Boolean(global.rows[0]?.value.paused), btcRegime:btc.rows[0]?.btc_regime ?? "TRANSITION", btcContext:btc.rows[0]?.btc_context,
     marginUsagePercent:Number(risk.rows[0]?.value.marginUsagePercent ?? 0), balanceUsdc:Number(risk.rows[0]?.value.balanceUsdc ?? 0),
     variationalLoggedIn:Boolean(session.rows[0]?.value.loggedIn), variationalReconciled:Boolean(session.rows[0]?.value.reconciled), assets:assets.rows.map((x) => camelAsset(x as Record<string,unknown>)),
@@ -185,7 +255,16 @@ app.get("/api/market/:symbol/candles",async(request)=>{
   if(!asset)return {symbol,interval:params.interval,candles,signals:[],orders:[],heatmap:[]};
   const [signals,orders,snapshot]=await Promise.all([
     query(`SELECT closed_at,direction,accepted,executable FROM signals WHERE asset_id=$1 AND closed_at>=to_timestamp($2/1000.0) ORDER BY closed_at`,[asset.id,candles[0]?.openTime??Date.now()]),
-    query(`SELECT created_at,direction,state,entry_price,stop_loss,take_profit FROM orders WHERE asset_id=$1 AND created_at>=to_timestamp($2/1000.0) ORDER BY created_at`,[asset.id,candles[0]?.openTime??Date.now()]),
+    // Only orders that exist on the platform right now get a price line. The
+    // resting model replaces an order every time the structure moves, so
+    // "created inside the candle window" accumulated every cancelled and
+    // closed order as a full-width line — AAVE drew 39 of them for 13 dead
+    // orders and no live one. A line across the chart asserts "this price
+    // matters now", which a cancelled order's entry does not. Live orders are
+    // not time-filtered either: a position opened before the window still has
+    // a stop that matters.
+    query(`SELECT created_at,direction,state,entry_price,stop_loss,take_profit FROM orders
+      WHERE asset_id=$1 AND state IN ('PENDING_ENTRY','FILLED_OPEN') ORDER BY created_at`,[asset.id]),
     query<{heatmap:unknown}>("SELECT heatmap FROM indicator_snapshots WHERE asset_id=$1 ORDER BY closed_at DESC LIMIT 1",[asset.id])
   ]);
   return {symbol,interval:params.interval,candles,signals:signals.rows,orders:orders.rows,heatmap:snapshot.rows[0]?.heatmap??[]};
@@ -204,7 +283,7 @@ app.post("/api/assets/validate", async (request, reply) => {
 });
 app.post("/api/assets", async (request, reply) => {
   let input = assetInput.parse(request.body);
-  const count=await query<{count:string}>("SELECT count(*)::text count FROM assets");if(Number(count.rows[0]?.count??0)>=50)return reply.code(409).send({error:"ASSET_LIMIT_REACHED"});
+  const count=await query<{count:string}>("SELECT count(*)::text count FROM assets");if(Number(count.rows[0]?.count??0)>=fixedRules.maxAssets)return reply.code(409).send({error:"ASSET_LIMIT_REACHED",message:`白名单已达 ${fixedRules.maxAssets} 个上限`});
   const resolved=await binance.resolvePerpetualSymbol(input.code);if(!resolved)return reply.code(422).send({error:"BINANCE_SYMBOL_INVALID"});input={...input,binanceSymbol:resolved};
   let coinglass;try { coinglass=await captureCoinGlassHeatmap(input.coinglassUrl); } catch (e) { return reply.code(422).send({ error:"COINGLASS_HEATMAP_INVALID", message:e instanceof Error?e.message:String(e) }); }
   if(coinglass.parsed.symbol!==`Binance_${resolved}`)return reply.code(422).send({error:"COINGLASS_SYMBOL_MISMATCH",message:`CoinGlass coin ${coinglass.parsed.coin} does not match Binance symbol ${resolved}`});
@@ -252,8 +331,8 @@ app.post("/api/strategies", async (request,reply) => {
   const input=strategyInput.parse(request.body);
   const row=await transaction(async (client)=>{
     if(input.enabled){ await client.query("UPDATE strategies SET enabled=false,updated_at=now() WHERE enabled=true");await client.query("UPDATE heatmap_candidates SET status='INVALIDATED',invalid_reason='STRATEGY_SWITCH' WHERE status IN ('ARMED','CONFIRMED')");}
-    const result=await client.query(`INSERT INTO strategies(name,enabled,logic,required_count,conditions,heatmap_range,max_orders_per_side)
-      VALUES($1,$2,$3,$4,$5,$6,$7) RETURNING *`,[input.name,input.enabled,input.logic,input.requiredCount??null,input.conditions,input.heatmapRange,input.maxOrdersPerSide]);
+    const result=await client.query(`INSERT INTO strategies(name,enabled,logic,required_count,conditions,heatmap_range,max_orders_per_side,entry_kind,resting_entry)
+      VALUES($1,$2,$3,$4,$5,$6,$7,$8,$9) RETURNING *`,[input.name,input.enabled,input.logic,input.requiredCount??null,input.conditions,input.heatmapRange,input.maxOrdersPerSide,input.entryKind,JSON.stringify(input.restingEntry)]);
     if(input.enabled) await client.query("INSERT INTO outbox(topic,payload) VALUES('strategy.changed',$1)",[JSON.stringify({strategyId:result.rows[0].id})]);
     return result.rows[0];
   });
@@ -268,9 +347,11 @@ app.post("/api/strategies/:id/enable", async (request,reply) => {
 app.patch("/api/strategies/:id",async(request,reply)=>{
   const id=z.string().uuid().parse((request.params as {id:string}).id);
   const current=(await query<Record<string,unknown>>("SELECT * FROM strategies WHERE id=$1",[id])).rows[0];if(!current)return reply.code(404).send({error:"STRATEGY_NOT_FOUND"});
-  const partial=z.object({name:z.string().trim().min(3).max(80),enabled:z.boolean(),logic:z.enum(["AND","N_OF_M"]),requiredCount:z.number().int().min(2).max(4).nullable(),conditions:z.array(z.enum(["OI","CVD","FUNDING","HEATMAP"])).min(2).max(4),heatmapRange:z.enum(["12h","24h","3d","7d","30d"]),maxOrdersPerSide:z.number().int().min(1).max(20)}).partial().parse(request.body);
-  const merged=strategyInput.parse({name:partial.name??current.name,enabled:partial.enabled??current.enabled,logic:partial.logic??current.logic,requiredCount:"requiredCount" in partial?partial.requiredCount:current.required_count,conditions:partial.conditions??current.conditions,heatmapRange:partial.heatmapRange??current.heatmap_range,maxOrdersPerSide:partial.maxOrdersPerSide??current.max_orders_per_side});
-  const row=await transaction(async(client)=>{if(merged.enabled){await client.query("UPDATE strategies SET enabled=false,updated_at=now() WHERE enabled=true AND id<>$1",[id]);await client.query("UPDATE heatmap_candidates SET status='INVALIDATED',invalid_reason='STRATEGY_SWITCH' WHERE status IN ('ARMED','CONFIRMED')");}const result=await client.query(`UPDATE strategies SET name=$1,enabled=$2,logic=$3,required_count=$4,conditions=$5,heatmap_range=$6,max_orders_per_side=$7,updated_at=now() WHERE id=$8 RETURNING *`,[merged.name,merged.enabled,merged.logic,merged.requiredCount??null,merged.conditions,merged.heatmapRange,merged.maxOrdersPerSide,id]);if(merged.enabled)await client.query("INSERT INTO outbox(topic,payload) VALUES('strategy.changed',$1)",[JSON.stringify({strategyId:id})]);return result.rows[0];});
+  const partial=z.object({name:z.string().trim().min(3).max(80),enabled:z.boolean(),logic:z.enum(["AND","N_OF_M"]),requiredCount:z.number().int().min(2).max(4).nullable(),conditions:z.array(z.enum(["OI","CVD","FUNDING","HEATMAP"])).min(2).max(4),heatmapRange:z.enum(["12h","24h","3d","7d","30d"]),maxOrdersPerSide:z.number().int().min(1).max(20),entryKind:z.enum(["MARKET_ON_SIGNAL","RESTING_LIMIT"]),restingEntry:restingEntryInput}).partial().parse(request.body);
+  // Resting-entry keys merge field by field, like every other column here: a
+  // PATCH that only moves maxArmedAssets must not silently reset the band.
+  const merged=strategyInput.parse({name:partial.name??current.name,enabled:partial.enabled??current.enabled,logic:partial.logic??current.logic,requiredCount:"requiredCount" in partial?partial.requiredCount:current.required_count,conditions:partial.conditions??current.conditions,heatmapRange:partial.heatmapRange??current.heatmap_range,maxOrdersPerSide:partial.maxOrdersPerSide??current.max_orders_per_side,entryKind:partial.entryKind??current.entry_kind,restingEntry:{...(current.resting_entry as Record<string,number>|null??{}),...partial.restingEntry}});
+  const row=await transaction(async(client)=>{if(merged.enabled){await client.query("UPDATE strategies SET enabled=false,updated_at=now() WHERE enabled=true AND id<>$1",[id]);await client.query("UPDATE heatmap_candidates SET status='INVALIDATED',invalid_reason='STRATEGY_SWITCH' WHERE status IN ('ARMED','CONFIRMED')");}const result=await client.query(`UPDATE strategies SET name=$1,enabled=$2,logic=$3,required_count=$4,conditions=$5,heatmap_range=$6,max_orders_per_side=$7,entry_kind=$8,resting_entry=$9,updated_at=now() WHERE id=$10 RETURNING *`,[merged.name,merged.enabled,merged.logic,merged.requiredCount??null,merged.conditions,merged.heatmapRange,merged.maxOrdersPerSide,merged.entryKind,JSON.stringify(merged.restingEntry),id]);if(merged.enabled)await client.query("INSERT INTO outbox(topic,payload) VALUES('strategy.changed',$1)",[JSON.stringify({strategyId:id})]);return result.rows[0];});
   return camelStrategy(row);
 });
 app.delete("/api/strategies/:id",async(request,reply)=>{const id=z.string().uuid().parse((request.params as {id:string}).id);const current=(await query<{enabled:boolean}>("SELECT enabled FROM strategies WHERE id=$1",[id])).rows[0];if(!current)return reply.code(404).send({error:"STRATEGY_NOT_FOUND"});if(current.enabled)return reply.code(409).send({error:"ACTIVE_STRATEGY",message:"请先启用另一套策略"});const used=await query<{count:string}>("SELECT (SELECT count(*) FROM signals WHERE strategy_id=$1)+(SELECT count(*) FROM orders WHERE strategy_id=$1) count",[id]);if(Number(used.rows[0]?.count??0)>0)return reply.code(409).send({error:"STRATEGY_HAS_AUDIT_HISTORY",message:"有信号或订单历史的策略只能停用，不能删除"});await query("DELETE FROM strategies WHERE id=$1",[id]);return reply.code(204).send();});
@@ -287,6 +368,85 @@ app.get("/api/fills",async(request)=>{
   return (await query(`SELECT f.*,a.code,o.direction FROM fills f JOIN orders o ON o.id=f.order_id JOIN assets a ON a.id=o.asset_id
     ORDER BY f.filled_at DESC LIMIT $1`,[input.limit])).rows;
 });
+/**
+ * The working-order board. Distance to market is reported in ATR as well as
+ * percent because ATR is the unit every threshold in the model is expressed
+ * in — "0.9 ATR away" says whether the order is inside its band, "1.4%" does
+ * not. The ATR comes from the scan that placed or last revalidated the order,
+ * which is exactly the number the decision was made against.
+ */
+app.get("/api/resting-orders", async () => (await query(`SELECT o.id,o.direction,o.state,o.entry_price,o.stop_loss,o.take_profit,o.margin_usdc,
+  o.entry_provenance,o.revalidated_at,o.created_at,o.platform_order_id,a.code,a.variational_url,
+  i.price market_price,i.closed_at market_closed_at,
+  (SELECT p.decision_reason FROM entry_plans p WHERE p.working_order_id=o.id ORDER BY p.closed_at DESC LIMIT 1) last_decision_reason
+  FROM orders o JOIN assets a ON a.id=o.asset_id
+  LEFT JOIN LATERAL (SELECT price,closed_at FROM indicator_snapshots s WHERE s.asset_id=o.asset_id ORDER BY closed_at DESC LIMIT 1) i ON true
+  WHERE o.state='PENDING_ENTRY' AND o.entry_kind='RESTING_LIMIT' ORDER BY o.created_at`)).rows.map((raw)=>{
+  const row=raw as Record<string,unknown>;
+  const provenance=row.entry_provenance as {atr1h?:number;sources?:string[];score?:number}|null;
+  const level=Number(row.entry_price),market=row.market_price==null?null:Number(row.market_price);
+  const atr=provenance?.atr1h&&provenance.atr1h>0?provenance.atr1h:null;
+  const distance=market==null?null:Math.abs(market-level);
+  const risk=Math.abs(level-Number(row.stop_loss));
+  return {
+    id:row.id,code:row.code,direction:row.direction,level,stopLoss:Number(row.stop_loss),takeProfit:Number(row.take_profit),
+    marginUsdc:row.margin_usdc==null?null:Number(row.margin_usdc),marketPrice:market,
+    distanceAtr:distance==null||!atr?null:distance/atr,
+    distancePercent:distance==null||!market?null:distance/market*100,
+    expectedRiskReward:risk>0?Math.abs(Number(row.take_profit)-level)/risk:null,
+    sources:provenance?.sources??[],score:provenance?.score??null,provenance,
+    ageMinutes:(Date.now()-new Date(String(row.created_at)).getTime())/60_000,
+    revalidatedAt:row.revalidated_at,createdAt:row.created_at,lastDecisionReason:row.last_decision_reason,
+    platformOrderId:row.platform_order_id,variationalUrl:row.variational_url
+  };
+}));
+
+app.get("/api/entry-plans",async(request)=>{
+  const input=z.object({
+    limit:z.coerce.number().int().min(1).max(500).default(100),
+    offset:z.coerce.number().int().min(0).default(0),
+    assetId:z.string().uuid().optional(),
+    mode:z.enum(["shadow","live"]).optional(),
+    decision:z.enum(["PLACE","KEEP","REPLACE","CANCEL","CLOSE_OPPOSITE","NONE"]).optional()
+  }).parse(request.query);
+  const filters:string[]=[],values:unknown[]=[];
+  if(input.assetId){values.push(input.assetId);filters.push(`p.asset_id=$${values.length}`);}
+  if(input.mode){values.push(input.mode);filters.push(`p.mode=$${values.length}`);}
+  if(input.decision){values.push(input.decision);filters.push(`p.decision=$${values.length}`);}
+  const where=filters.length?`WHERE ${filters.join(" AND ")}`:"";
+  const [rows,total]=await Promise.all([
+    query(`SELECT p.*,a.code FROM entry_plans p JOIN assets a ON a.id=p.asset_id ${where}
+      ORDER BY p.closed_at DESC,a.code LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,input.limit,input.offset]),
+    query<{count:string}>(`SELECT count(*)::text count FROM entry_plans p ${where}`,values)
+  ]);
+  return {rows:rows.rows,total:Number(total.rows[0]?.count??0)};
+});
+
+/**
+ * The shadow-vs-live comparison from spec 6-2. Fill rate is counted over
+ * decisions that actually put an order on the book; the average entry
+ * distance is what the model bought with all that waiting; realised R is
+ * grouped by exit reason so a good ratio built entirely out of stop-outs
+ * cannot hide inside an average.
+ */
+app.get("/api/resting-statistics",async()=>{
+  const [ledger,outcomes]=await Promise.all([
+    query<{mode:string;decision:string;count:string}>("SELECT mode,decision,count(*)::text count FROM entry_plans GROUP BY mode,decision"),
+    query<{state:string;count:string;avg_rr:string|null;avg_distance:string|null}>(`SELECT o.state,count(*)::text count,
+      avg(CASE WHEN abs(o.entry_price-o.stop_loss)>0 THEN o.realized_pnl/(o.margin_usdc*abs(o.entry_price-o.stop_loss)/o.entry_price*o.leverage) END)::text avg_rr,
+      avg(abs((o.entry_provenance->>'referencePrice')::numeric-o.entry_price)/nullif((o.entry_provenance->>'atr1h')::numeric,0))::text avg_distance
+      FROM orders o WHERE o.entry_kind='RESTING_LIMIT' AND o.state IN ('CLOSED_TP','CLOSED_SL','LIQUIDATED','CLOSED_REVERSED') GROUP BY o.state`)
+  ]);
+  const placed=ledger.rows.filter((row)=>["PLACE","REPLACE"].includes(row.decision)).reduce((sum,row)=>sum+Number(row.count),0);
+  const filled=(await query<{count:string}>("SELECT count(*)::text count FROM orders WHERE entry_kind='RESTING_LIMIT' AND state IN ('FILLED_OPEN','CLOSED_TP','CLOSED_SL','LIQUIDATED','CLOSED_REVERSED')")).rows[0];
+  const filledCount=Number(filled?.count??0);
+  return {
+    ledger:ledger.rows.map((row)=>({...row,count:Number(row.count)})),
+    placed,filled:filledCount,fillRate:placed?filledCount/placed:0,
+    byExit:outcomes.rows.map((row)=>({state:row.state,count:Number(row.count),averageRealizedRiskReward:row.avg_rr==null?null:Number(row.avg_rr),averageEntryDistanceAtr:row.avg_distance==null?null:Number(row.avg_distance)}))
+  };
+});
+
 app.get("/api/statistics", async () => {const summary=(await query(`SELECT s.id,s.name,
   (SELECT count(*) FROM signals sig WHERE sig.strategy_id=s.id AND sig.accepted)::int signals,
   (SELECT count(*) FROM signals sig WHERE sig.strategy_id=s.id AND sig.accepted AND NOT sig.executable)::int non_executable_signals,
@@ -297,6 +457,26 @@ app.get("/api/statistics", async () => {const summary=(await query(`SELECT s.id,
   coalesce((SELECT sum(o.realized_pnl) FROM orders o WHERE o.strategy_id=s.id),0)::float realized_pnl
   FROM strategies s ORDER BY s.created_at`)).rows;const outcomes=await query<{strategy_id:string;state:string}>("SELECT strategy_id,state FROM orders WHERE state IN ('CLOSED_TP','CLOSED_SL') ORDER BY updated_at");return summary.map((row)=>{let wins=0,losses=0,maxConsecutiveWins=0,maxConsecutiveLosses=0;for(const outcome of outcomes.rows.filter((item)=>item.strategy_id===row.id)){if(outcome.state==="CLOSED_TP"){wins+=1;losses=0;maxConsecutiveWins=Math.max(maxConsecutiveWins,wins);}else{losses+=1;wins=0;maxConsecutiveLosses=Math.max(maxConsecutiveLosses,losses);}}return {...row,max_consecutive_wins:maxConsecutiveWins,max_consecutive_losses:maxConsecutiveLosses};});});
 
+app.get("/api/signals",async(request)=>{
+  const input=z.object({
+    limit:z.coerce.number().int().min(1).max(200).default(50),
+    offset:z.coerce.number().int().min(0).default(0),
+    assetId:z.string().uuid().optional(),
+    strategyId:z.string().uuid().optional()
+  }).parse(request.query);
+  const filters:string[]=[],values:unknown[]=[];
+  if(input.assetId){values.push(input.assetId);filters.push(`sig.asset_id=$${values.length}`);}
+  if(input.strategyId){values.push(input.strategyId);filters.push(`sig.strategy_id=$${values.length}`);}
+  const where=filters.length?`WHERE ${filters.join(" AND ")}`:"";
+  const [rows,total]=await Promise.all([
+    query(`SELECT sig.id,sig.closed_at,sig.direction,sig.executable,sig.accepted,sig.conditions,sig.rejection_reasons,
+      a.code asset_code,s.name strategy_name,s.conditions strategy_conditions,o.id order_id,o.state order_state,o.entry_price,o.stop_loss,o.take_profit,o.realized_pnl
+      FROM signals sig JOIN assets a ON a.id=sig.asset_id JOIN strategies s ON s.id=sig.strategy_id LEFT JOIN orders o ON o.signal_id=sig.id
+      ${where} ORDER BY sig.closed_at DESC LIMIT $${values.length+1} OFFSET $${values.length+2}`,[...values,input.limit,input.offset]),
+    query<{count:string}>(`SELECT count(*)::text count FROM signals sig ${where}`,values)
+  ]);
+  return {rows:rows.rows,total:Number(total.rows[0]?.count??0)};
+});
 app.post("/api/control/global", async (request) => {
   const input=z.object({paused:z.boolean(),reason:z.string().max(300).nullable().optional()}).parse(request.body);
   const latest=(await query<{closed_at:string}>("SELECT max(closed_at)::text closed_at FROM indicator_snapshots")).rows[0]?.closed_at;
@@ -311,53 +491,28 @@ app.post("/api/control/assets/:id", async (request) => {
 app.get("/api/settings/status", async () => {
   const session=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='coinglass_session'")).rows[0]?.value;
   return {
-    coinglassMode:config.COINGLASS_ADAPTER_MODE,coinglassReady:Boolean(session?.ready??session?.loggedIn),
-    coinglassSessionConfigured:Boolean(coinGlassObe),coinglassFingerprintCount:Object.keys(coinGlassBrowserHeaders).length,
-    telegramConfigured,variationalMode:config.VARIATIONAL_ADAPTER_MODE,liveTradingEnabled:config.LIVE_TRADING_ENABLED
+    coinglassMode:config.COINGLASS_ADAPTER_MODE,coinglassReady:Boolean(session?.ready??session?.loggedIn),coinglassError:session?.error??null,
+    telegramConfigured,variationalMode:config.VARIATIONAL_ADAPTER_MODE,liveTradingEnabled,defaultMarginUsdc,maxMarginUsdc
   };
 });
 app.get("/api/settings/secrets/:kind",async(request)=>{
-  const kind=z.enum(["telegram","coinglass"]).parse((request.params as {kind:string}).kind);
-  if(kind==="coinglass")return {obe:coinGlassObe,browserHeaders:coinGlassBrowserHeaders};
+  const kind=z.enum(["telegram"]).parse((request.params as {kind:string}).kind);
+  void kind;
   return {botToken:telegramBotToken,chatId:telegramChatId};
 });
 
-const coinGlassSecretInput=z.object({
-  obe:z.string().trim().max(4096).default(""),
-  browserHeaders:z.record(z.string(),z.string().max(1024).refine((v)=>!/[\r\n]/.test(v),"header values cannot contain line breaks"))
-    .default({})
-    .refine((value)=>Object.keys(value).every((name)=>(coinGlassBrowserHeaderNames as readonly string[]).includes(name)),
-      `browserHeaders may only contain: ${coinGlassBrowserHeaderNames.join(", ")}`),
-  coinglassUrl:z.string().url().optional()
-});
-
-async function probeCoinGlass(input:z.infer<typeof coinGlassSecretInput>){
+// The CoinGlass session lives inside the coinglass-agent's own logged-in
+// Chrome profile (§13.2 style: no credential to store), not an .env secret;
+// this only proves the agent can currently reach a live Heatmap.
+app.post("/api/settings/coinglass/test",async(request,reply)=>{
+  const input=z.object({coinglassUrl:z.string().url().optional()}).parse(request.body??{});
   const url=input.coinglassUrl
     ??(await query<{coinglass_url:string}>("SELECT coinglass_url FROM assets WHERE collect_enabled=true ORDER BY code LIMIT 1")).rows[0]?.coinglass_url;
-  if(!url)throw new Error("先添加一个启用采集的币种，或提供一个 CoinGlass Heatmap URL 用于测试");
-  const client=new CoinGlassFreeWebClient(undefined,undefined,undefined,input.obe,input.browserHeaders);
-  const captured=await client.capture(url,"24h");
-  return {url,regionCount:captured.regions.length,capturedAt:captured.capturedAt.toISOString()};
-}
-
-app.post("/api/settings/coinglass/test",async(request,reply)=>{
-  const input=coinGlassSecretInput.parse(request.body);
-  try{return {ok:true,...await probeCoinGlass(input)};}
-  catch(error){return reply.code(422).send({error:"COINGLASS_TEST_FAILED",message:error instanceof Error?error.message:String(error)});}
-});
-
-app.post("/api/settings/coinglass/save",async(request,reply)=>{
-  const input=coinGlassSecretInput.parse(request.body);
-  let probe;
-  // Spec 13.2: verify against the real platform first, then persist.
-  try{probe=await probeCoinGlass(input);}
-  catch(error){return reply.code(422).send({error:"COINGLASS_TEST_FAILED",message:error instanceof Error?error.message:String(error)});}
-  const encoded=Object.keys(input.browserHeaders).length?Buffer.from(JSON.stringify(input.browserHeaders),"utf8").toString("base64url"):"";
-  await writeEnvValues({COINGLASS_OBE:input.obe,COINGLASS_BROWSER_HEADERS_B64:encoded,COINGLASS_ADAPTER_MODE:"free-web"});
-  coinGlassObe=input.obe;coinGlassBrowserHeaders={...input.browserHeaders};
-  coinGlass=new CoinGlassFreeWebClient(undefined,undefined,undefined,coinGlassObe,coinGlassBrowserHeaders);
-  await requestServiceRestart("coinglass-agent");
-  return {ok:true,restartRequested:true,...probe};
+  if(!url)return reply.code(422).send({error:"COINGLASS_TEST_FAILED",message:"先添加一个启用采集的币种，或提供一个 CoinGlass Heatmap URL 用于测试"});
+  try{
+    const captured=await requestCoinGlassCapture(url,"24h");
+    return {ok:true,url,regionCount:captured.regions.length,capturedAt:captured.capturedAt.toISOString()};
+  }catch(error){return reply.code(422).send({error:"COINGLASS_TEST_FAILED",message:error instanceof Error?error.message:String(error)});}
 });
 
 app.get("/api/settings/restarts",async()=>
@@ -381,26 +536,86 @@ app.get("/api/health/details",async()=>{
   };
 });
 app.get("/api/settings/notifications",async()=> (await query("SELECT event_type,enabled FROM notification_preferences ORDER BY event_type")).rows);
-app.put("/api/settings/notifications/:eventType",async(request)=>{
-  const eventType=z.enum(["signal","order_created","order_failed","entry_filled","closed_tp","closed_sl_or_liquidated","system_error","variational_session_lost","margin_pause_resume","service_recovered"]).parse((request.params as {eventType:string}).eventType);
+app.put("/api/settings/notifications/:eventType",async(request,reply)=>{
+  // Validated against the rows that actually exist rather than a list copied
+  // into the code: the hardcoded enum silently went stale when new topics were
+  // added, leaving resting_order_replaced and venue_limit_rejected impossible
+  // to toggle from the UI at all — a notification the operator cannot switch
+  // off is a notification they will eventually start ignoring wholesale.
+  const eventType=z.string().min(1).max(64).parse((request.params as {eventType:string}).eventType);
   const input=z.object({enabled:z.boolean()}).parse(request.body);
-  await query("UPDATE notification_preferences SET enabled=$1,updated_at=now() WHERE event_type=$2",[input.enabled,eventType]);return {ok:true};
+  const updated=await query("UPDATE notification_preferences SET enabled=$1,updated_at=now() WHERE event_type=$2",[input.enabled,eventType]);
+  if(!updated.rowCount)return reply.code(404).send({error:"UNKNOWN_NOTIFICATION_TYPE",message:`没有名为 ${eventType} 的通知类型`});
+  return {ok:true};
 });
 app.post("/api/settings/telegram/test", async (request,reply) => {
   const input=z.object({botToken:z.string().min(20),chatId:z.string().min(1)}).parse(request.body);
   const previous=(await query<{state:string}>("SELECT state FROM service_health WHERE service='telegram-worker'")).rows[0]?.state;
   try{await sendTelegramTest(input.botToken,input.chatId,previous==="degraded"?"HuxTrade Telegram 服务已恢复。":"HuxTrade Telegram 配置测试成功。");}
-  catch{return reply.code(422).send({error:"TELEGRAM_TEST_FAILED"});}
+  catch(error){return reply.code(422).send({error:"TELEGRAM_TEST_FAILED",message:error instanceof Error?error.message:String(error)});}
   await recordHealth("telegram-worker",true,undefined,false,false); return {ok:true,recovered:previous==="degraded"};
 });
 app.post("/api/settings/telegram/save", async (request,reply) => {
   const input=z.object({botToken:z.string().min(20),chatId:z.string().min(1)}).parse(request.body);
   try{await sendTelegramTest(input.botToken,input.chatId,"HuxTrade Telegram 配置已验证并保存。");}
-  catch{return reply.code(422).send({error:"TELEGRAM_TEST_FAILED"});}
+  catch(error){return reply.code(422).send({error:"TELEGRAM_TEST_FAILED",message:error instanceof Error?error.message:String(error)});}
   await writeEnvValues({TELEGRAM_BOT_TOKEN:input.botToken,TELEGRAM_CHAT_ID:input.chatId});
   telegramBotToken=input.botToken;telegramChatId=input.chatId;
   telegramConfigured=true;
   await requestServiceRestart("telegram-worker");
+  return {ok:true,restartRequested:true};
+});
+
+// Spec's execution safety gate: LIVE_TRADING_ENABLED is a config value cached
+// in each process's memory at startup, so flipping it only takes effect once
+// a service restarts and re-reads .env. Two services gate on it independently
+// — variational-agent (order submission) and signal-engine (the riskGate that
+// decides a signal is executable) — so both must be bounced, or signal-engine
+// keeps rejecting with LIVE_TRADING_DISABLED on its stale cached value.
+// Disabling is never blocked — an operator must always be able to kill live
+// trading immediately. Enabling requires a currently valid, reconciled
+// Variational session so the switch can't arm trading against a session
+// that's actually logged out.
+app.post("/api/settings/live-trading",async(request,reply)=>{
+  const input=z.object({enabled:z.boolean()}).parse(request.body);
+  if(input.enabled){
+    if(config.VARIATIONAL_ADAPTER_MODE!=="browser-fetch")return reply.code(422).send({error:"LIVE_TRADING_BLOCKED",message:"VARIATIONAL_ADAPTER_MODE 必须是 browser-fetch"});
+    const session=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='variational_session'")).rows[0]?.value;
+    if(!session?.loggedIn||!session?.reconciled)return reply.code(422).send({error:"LIVE_TRADING_BLOCKED",message:"Variational 会话未登录或未完成启动对账，不能开启真实交易"});
+  }
+  await writeEnvValues({LIVE_TRADING_ENABLED:input.enabled?"true":"false"});
+  liveTradingEnabled=input.enabled;
+  await requestServiceRestart("variational-agent");
+  await requestServiceRestart("signal-engine");
+  return {ok:true,restartRequested:true};
+});
+
+// Both signal-engine (sizes every new plan) and variational-agent (enforces
+// the platform-minimum cap in adjustMarginForPlatformMinimum) cache these at
+// startup, same as LIVE_TRADING_ENABLED, so both need bouncing to pick up a
+// change. defaultMarginUsdc alone above maxMarginUsdc would reject every
+// order outright (adjustMarginForPlatformMinimum takes max(default,required)
+// before comparing to the cap), so that ordering is enforced here up front.
+app.post("/api/settings/margin",async(request,reply)=>{
+  const input=z.object({defaultMarginUsdc:z.number().min(1),maxMarginUsdc:z.number().min(1)}).parse(request.body);
+  if(input.defaultMarginUsdc>input.maxMarginUsdc)return reply.code(422).send({error:"MARGIN_INVALID",message:"默认保证金不能超过保证金上限"});
+  await writeEnvValues({DEFAULT_MARGIN_USDC:String(input.defaultMarginUsdc),MAX_MARGIN_USDC:String(input.maxMarginUsdc)});
+  defaultMarginUsdc=input.defaultMarginUsdc;
+  maxMarginUsdc=input.maxMarginUsdc;
+  await requestServiceRestart("signal-engine");
+  await requestServiceRestart("variational-agent");
+  return {ok:true,restartRequested:true};
+});
+
+// The dedicated Variational Chrome window can crash or get closed outside
+// the agent's control. variational-agent now relaunches it itself the next
+// time it tries to connect (same real Chrome.app, same persistent profile,
+// so an existing login survives) — this button just forces that moment now
+// instead of waiting up to one poll interval, by restarting the process
+// that owns the connection. No .env write, no restart-blocking session
+// check: unlike live-trading, there's nothing here that arms real trading.
+app.post("/api/settings/variational/reopen-browser",async()=>{
+  await requestServiceRestart("variational-agent");
   return {ok:true,restartRequested:true};
 });
 

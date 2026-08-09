@@ -66,15 +66,19 @@ services:
       api: { condition: service_healthy }
     restart: unless-stopped
 
+  # coinglass-agent drives a real logged-in Chrome to read the free web
+  # Heatmap (CoinGlass decrypts it; the agent just reads the result), so on
+  # Mac it runs natively against the operator's Chrome, same as
+  # variational-agent. Only in the Linux profile does it run containerized,
+  # with its own persistent browser profile the operator logs into once.
   coinglass-agent:
+    profiles: ["linux-agent"]
     build:
       context: .
       args: { APP_FILTER: "@huxtrade/coinglass-agent" }
     env_file: .env
     environment: { NODE_ENV: production }
-    # The session header can be rewritten from 系统设置; the bind mount lets a
-    # restart pick up the new .env instead of the value baked in at creation.
-    volumes: ["./.env:/app/.env"]
+    volumes: ["coinglass_profile:/app/coinglass-profile"]
     depends_on:
       api: { condition: service_healthy }
     restart: unless-stopped
@@ -115,3 +119,4 @@ services:
 volumes:
   postgres_data:
   variational_profile:
+  coinglass_profile:

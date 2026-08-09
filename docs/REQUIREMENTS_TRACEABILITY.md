@@ -2,7 +2,7 @@
 
 | 验收项 | 实现位置 | 自动验证/状态 |
 |---|---|---|
-| AC-01 白名单双源校验 | `apps/api/src/index.ts`、`packages/exchange-clients`、`apps/coinglass-agent` | API 保存/换链前验证 Binance 合约与 CoinGlass 币种一致性，并实际请求、解密、规范化 Heatmap；成功后资产和首份 24h 缓存同事务写入 |
+| AC-01 白名单双源校验 | `apps/api/src/index.ts`、`packages/exchange-clients`、`apps/coinglass-agent` | API 保存/换链前通过 `coinglass_probe_request`/`coinglass_probe_result` 握手请求原生 coinglass-agent 用真实登录 Chrome 实际抓取一次 Heatmap（解密由 CoinGlass 页面自己完成），并校验 Binance 合约一致性；成功后资产和首份 24h 缓存同事务写入 |
 | AC-02 启动预热、对账、下一根 K 线 | Collector 对齐时钟、30 天基线、Agent 启动对账门 | `reconciled=false` 会阻断执行；浏览器上下文只读对账 Adapter 已实现 |
 | AC-03 BTC + 四条件默认策略 | `packages/indicators`、`packages/strategy-engine`、`apps/signal-engine` | OI 1h、CVD 15m、Funding 4h 绝对变化、Heatmap 延迟确认均有确定性测试 |
 | AC-04 每 15 分钟最多一单、默认上限 5 | signals 唯一约束、riskGate、orders 幂等键 | PostgreSQL 引擎测试已验证方向唯一约束和幂等键 |
@@ -58,10 +58,20 @@ pnpm build      Next.js 与所有 TypeScript 服务通过
 - 全局手动暂停或 80% 保证金自动暂停时，Collector 不再创建扫描批次；恢复后只等待下一根完整收盘 K 线。
 - Variational Profile 与发现输出的相对路径改为相对根 `.env` 解析，避免 pnpm workspace 静默创建错误的空 Profile；launchd 安装器强制要求只读模式和回环 CDP。
 
+## 2026-08-05 CoinGlass Heatmap 改为浏览器驱动
+
+用户反馈免费网页版 Heatmap 抓取又开始失败（`CoinGlass free web Heatmap returned an unsupported encryption version`）。用真实登录的 Chrome 直接抓包核实：CoinGlass 把响应头 `v` 从 `0` 换成了 `1`，此前逆向出的 AES-128-ECB + TOTP 签名协议随之失效；同时确认它不使用 WebCrypto（`crypto.subtle` 未被调用），是自带的混淆 JS 实现，继续逆向只是在追一个随时可能再变的移动目标。
+
+改为让 CoinGlass 自己解密：`apps/coinglass-agent` 新增 `browser-capture.ts`，用 Playwright 驱动一个真实登录的 Chrome 打开 Heatmap 页面，通过 `page.addInitScript` 在任何页面脚本执行前 hook `JSON.parse`，捕获 CoinGlass 前端自己解密出的 `{liq, y}` 明文，再复用原有的 `normalizeCoinGlassWebHeatmap` 计算强度区。非 24h 周期通过 Playwright 的 `getByRole('combobox')`/`getByRole('option')` 语义化定位器点选页面上的周期下拉框触发对应请求。移除了整套 AES/TOTP 逆向实现（`coinGlassWebSignature`、`decryptCoinGlassValue`、`CoinGlassFreeWebClient`）及配套的 HAR 导入工具（`har.ts`、`import-har.ts`）。
+
+`apps/api` 容器访问不到宿主机 Chrome，资产新增校验和系统设置「重新测试」改为通过 `app_state` 的 `coinglass_probe_request`/`coinglass_probe_result` 键值对，把一次性抓取请求转交给原生运行的 coinglass-agent 处理（复用 Collector 早已在用的 `coinglass_refresh_request`/`coinglass_refresh_result` 握手模式，只是换成任意 URL 而非已存资产）。`COINGLASS_ADAPTER_MODE` 从 `free-web` 改名为 `browser`；新增 `COINGLASS_PROFILE_PATH`/`COINGLASS_BROWSER_EXECUTABLE`/`COINGLASS_CDP_URL`，与 Variational 的浏览器配置对称。`docker-compose.yml` 中 coinglass-agent 移入 `linux-agent` profile，Mac 上原生运行（同 variational-agent）。
+
+**已知坑**：Google 的登录页会把 Playwright 自己启动的浏览器判定为「此浏览器或应用可能不安全」并拒绝登录（与 Variational Agent 已记录的 CAPTCHA 问题同源）。修复方式沿用 Variational 已有的解法——不让 Playwright 自己拉起浏览器，而是手动 `open`/直接执行 Chrome 二进制并带上 `--remote-debugging-port`，登录后把回环调试端口写入 `COINGLASS_CDP_URL`，Agent 改为 `connectOverCDP` 附加上去而不是新开一个自动化窗口。真实验证：BTC 无需登录即可直接抓取成功（19 个有效区）；ETH/SOL/XRP 在附加到已登录的调试端口 Chrome 后验证通过。
+
 ## 仍需外部条件的未完成项
 
 - Variational 浏览器上下文 Adapter 已实现；读取、报价、市价开平仓及 TP/SL 已有真实 HAR/页面结果。限价入场和主动撤单的成功/错误响应、平台幂等支持、登录失效生命周期尚未完成独立实盘验收，因此 `LIVE_TRADING_ENABLED` 继续默认关闭。
-- CoinGlass 免费 Heatmap 不需要 API Key；八个主流币真实请求及 BTC/ETH/SOL 数据库缓存均已通过。今后仅在会话失效或 Chrome 指纹变化时，需要重新导出包含 `liqHeatMap` 请求的 HAR 并执行导入。
+- CoinGlass 免费 Heatmap 不需要 API Key，也不再自己解密响应——2026-08-05 发现 CoinGlass 把响应加密版本从 `v0` 换成了 `v1`，此前逆向实现的 AES 客户端随之失效。改为 coinglass-agent 驱动真实登录 Chrome，读 CoinGlass 页面自己解密后的结果（hook `JSON.parse`），天然不受其加密算法变化影响；`apps/api` 容器无法直接访问宿主机 Chrome，改为通过 `app_state` 的 `coinglass_probe_request`/`coinglass_probe_result` 握手把一次性抓取请求转给原生运行的 Agent。今后仅在登录会话失效时，需要在 Agent 使用的那个 Chrome 窗口里重新登录一次，不再需要导出/导入 HAR。
 - Telegram 需要用户 Bot Token/Chat ID 才能完成真实发送、三次失败和手动恢复集成验收。
 
 ## 不能用模拟数据替代的验收

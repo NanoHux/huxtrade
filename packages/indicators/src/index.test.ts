@@ -48,3 +48,36 @@ describe("deterministic indicators", () => {
     expect(findAtrSwing(candles,2,"LONG")).toBe(103);
   });
 });
+
+describe("CVD direction requires every bin to agree",()=>{
+  const history=Array.from({length:2880},(_,i)=>i%2?120:-100);
+
+  it("confirms only when all three five-minute bins point the same way",()=>{
+    expect(cvdAnomaly({currentBins:[-900,-800,-700],history}).direction).toBe(-1);
+    expect(cvdAnomaly({currentBins:[900,800,700],history}).direction).toBe(1);
+  });
+
+  it("abstains when one large bin sets the total against the other two",()=>{
+    // The shape a 2-of-3 majority let through: the sum is positive, so the
+    // z-score reads as a buying anomaly, while the vote called it selling —
+    // strength and direction from opposite evidence, on the same bar.
+    const contradictory={currentBins:[5000,-40,-40],history};
+    expect(cvdAnomaly(contradictory).value).toBeGreaterThan(0);
+    expect(cvdAnomaly(contradictory).direction).toBe(0);
+    expect(cvdAnomaly(contradictory).passed).toBe(false);
+  });
+
+  it("never lets the confirmed direction contradict the sum",()=>{
+    // Structural, not incidental: three same-signed bins must sum to that sign.
+    for(const bins of [[3,1,2],[-3,-1,-2],[900,1,1],[-1,-900,-1]]){
+      const result=cvdAnomaly({currentBins:bins,history});
+      if(result.direction!==0)expect(Math.sign(result.value)).toBe(result.direction);
+    }
+  });
+
+  it("treats a silent bin as no agreement rather than as assent",()=>{
+    expect(cvdAnomaly({currentBins:[-500,-400,0],history}).direction).toBe(0);
+    expect(cvdAnomaly({currentBins:[0,0,0],history}).direction).toBe(0);
+    expect(cvdAnomaly({currentBins:[],history}).direction).toBe(0);
+  });
+});

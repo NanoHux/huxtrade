@@ -1,5 +1,3 @@
-import { createCipheriv,createDecipheriv,createHmac } from "node:crypto";
-import { gunzipSync } from "node:zlib";
 import { getConfig } from "@huxtrade/config";
 import type { Candle } from "@huxtrade/indicators";
 import type { HeatmapRegion } from "@huxtrade/shared-types";
@@ -113,12 +111,31 @@ export type CoinGlassWebHeatmapPayload={
 
 const coinGlassHeatmapPath=/^\/(?:[a-z]{2}(?:-[A-Z]{2})?\/)?pro\/futures\/LiquidationHeatMap$/;
 
+/**
+ * Variational's ticker is not always the Binance base symbol: LIT trades as
+ * LIGHTER, and stripping "USDT" off the Binance symbol produced
+ * `{"error_message":"asset: Asset not supported"}` on every submission for
+ * that asset. The operator already supplies the truth when adding the asset —
+ * it is the last path segment of variational_url — so that is the authority,
+ * and the Binance-derived name is only the fallback for a URL we cannot parse.
+ */
+export function variationalUnderlying(variationalUrl:string|null|undefined,binanceSymbol:string):string{
+  const fallback=binanceSymbol.trim().toUpperCase().replace(/USDT$/i,"");
+  try{
+    const segments=new URL((variationalUrl??"").trim()).pathname.split("/").filter(Boolean);
+    const last=(segments.at(-1)??"").toUpperCase();
+    return /^[A-Z0-9]{1,20}$/.test(last)?last:fallback;
+  }catch{return fallback;}
+}
+
 export function parseCoinGlassHeatmapUrl(value:string){
   const url=new URL(value);
   if(url.protocol!=="https:"||url.username||url.password||!["coinglass.com","www.coinglass.com"].includes(url.hostname.toLowerCase()))throw new Error("CoinGlass Heatmap URL must use https://www.coinglass.com");
   if(!coinGlassHeatmapPath.test(url.pathname))throw new Error("CoinGlass URL must point to the Model 1 LiquidationHeatMap page");
   const coin=(url.searchParams.get("coin")??"").trim().toUpperCase();
-  if(!/^[A-Z0-9]{2,20}$/.test(coin))throw new Error("CoinGlass Heatmap URL has an invalid coin query parameter");
+  // Single-character tickers exist ("4"), so length is not what makes a coin
+  // parameter valid — only its character set is.
+  if(!/^[A-Z0-9]{1,20}$/.test(coin))throw new Error("CoinGlass Heatmap URL has an invalid coin query parameter");
   const type=url.searchParams.get("type")??"pair";
   if(type!=="pair")throw new Error("CoinGlass Heatmap URL must use type=pair");
   url.searchParams.set("coin",coin);
@@ -132,90 +149,6 @@ export function buildCoinGlassHeatmapPageUrl(value:string,range:CoinGlassHeatmap
   const url=new URL(parsed.url);
   url.searchParams.set("time",coinGlassHeatmapRanges[range].pageTime);
   return url.toString();
-}
-
-const coinGlassTotpSecret="I65VU7K5ZQL7WB4E";
-const coinGlassSignatureKey=Buffer.from("1f68efd73f8d4921acc0dead41dd39bc");
-const coinGlassBase32Alphabet="ABCDEFGHIJKLMNOPQRSTUVWXYZ234567";
-
-function decodeBase32(value:string){
-  let bits="";
-  for(const character of value){
-    const index=coinGlassBase32Alphabet.indexOf(character);
-    if(index<0)throw new Error("CoinGlass signing secret contains invalid Base32 data");
-    bits+=index.toString(2).padStart(5,"0");
-  }
-  return Buffer.from(bits.match(/.{8}/g)?.map((byte)=>Number.parseInt(byte,2))??[]);
-}
-
-function coinGlassWebSignature(timestampMs:number){
-  const timestampSeconds=Math.floor(timestampMs/1000);
-  const counter=Buffer.alloc(8);
-  counter.writeBigUInt64BE(BigInt(Math.floor(timestampSeconds/30)));
-  const digest=createHmac("sha1",decodeBase32(coinGlassTotpSecret)).update(counter).digest();
-  const offset=digest[digest.length-1]!&0x0f;
-  const otp=String((digest.readUInt32BE(offset)&0x7fffffff)%1_000_000).padStart(6,"0");
-  const cipher=createCipheriv("aes-256-ecb",coinGlassSignatureKey,null);
-  return Buffer.concat([cipher.update(`${timestampSeconds},${otp}`,"utf8"),cipher.final()]).toString("base64");
-}
-
-function decryptCoinGlassValue(value:string,key:string){
-  if(key.length!==16)throw new Error("CoinGlass response encryption key has an invalid length");
-  if(value.length>12*1024*1024)throw new Error("CoinGlass encrypted response exceeds the safety limit");
-  const decipher=createDecipheriv("aes-128-ecb",Buffer.from(key),null);
-  const compressed=Buffer.concat([decipher.update(Buffer.from(value,"base64")),decipher.final()]);
-  const text=gunzipSync(compressed,{maxOutputLength:24*1024*1024}).toString("utf8");
-  return text.startsWith('"')&&text.endsWith('"')?JSON.parse(text) as string:text;
-}
-
-type CoinGlassEncryptedEnvelope={code:string|number;msg?:string;success?:boolean;data?:string};
-
-export const coinGlassBrowserHeaderNames=[
-  "accept-language","priority","sec-ch-ua","sec-ch-ua-mobile","sec-ch-ua-platform",
-  "sec-fetch-dest","sec-fetch-mode","sec-fetch-site","user-agent"
-] as const;
-export type CoinGlassBrowserHeaderName=typeof coinGlassBrowserHeaderNames[number];
-export type CoinGlassBrowserHeaders=Partial<Record<CoinGlassBrowserHeaderName,string>>;
-
-export class CoinGlassFreeWebClient{
-  constructor(
-    private readonly base="https://capi.coinglass.com",
-    private readonly fetchImpl:typeof fetch=fetch,
-    private readonly now:()=>number=()=>Date.now(),
-    private readonly obe="",
-    private readonly browserHeaders:CoinGlassBrowserHeaders={}
-  ){}
-
-  async capture(sourceUrl:string,range:CoinGlassHeatmapRange){
-    const parsed=parseCoinGlassHeatmapUrl(sourceUrl);
-    const rule=coinGlassHeatmapRanges[range];
-    const capturedAtMs=this.now();
-    const url=new URL("/api/index/v2/liqHeatMap",this.base);
-    for(const [key,value] of Object.entries({merge:"true",symbol:parsed.symbol,interval:rule.interval,limit:String(rule.limit),data:coinGlassWebSignature(capturedAtMs)}))url.searchParams.set(key,value);
-    const controller=new AbortController();
-    const timeout=setTimeout(()=>controller.abort(),30_000);
-    try{
-      const response=await this.fetchImpl(url,{signal:controller.signal,headers:{
-        accept:"application/json",language:"en",encryption:"true","cache-ts-v2":String(capturedAtMs),
-        origin:"https://www.coinglass.com",referer:"https://www.coinglass.com/",...this.browserHeaders,
-        ...(this.obe?{obe:this.obe}:{})
-      }});
-      if(!response.ok)throw new Error(`CoinGlass free web Heatmap returned HTTP ${response.status}`);
-      const body=await response.text();
-      if(body.length>12*1024*1024)throw new Error("CoinGlass Heatmap response exceeds the safety limit");
-      const envelope=JSON.parse(body) as CoinGlassEncryptedEnvelope;
-      if(String(envelope.code)!=="0"||!envelope.data)throw new Error(`CoinGlass free web Heatmap rejected request (${envelope.code}${envelope.msg?`: ${envelope.msg}`:""})`);
-      if(response.headers.get("encryption")!=="true"||response.headers.get("v")!=="0")throw new Error("CoinGlass free web Heatmap returned an unsupported encryption version");
-      const encryptedSessionKey=response.headers.get("user");
-      if(!encryptedSessionKey)throw new Error("CoinGlass free web Heatmap omitted its response key");
-      const firstKey=Buffer.from(String(capturedAtMs)).toString("base64").slice(0,16);
-      const sessionKey=decryptCoinGlassValue(encryptedSessionKey,firstKey);
-      const data=JSON.parse(decryptCoinGlassValue(envelope.data,sessionKey)) as NonNullable<CoinGlassWebHeatmapPayload["data"]>;
-      const payload:CoinGlassWebHeatmapPayload={code:envelope.code,msg:envelope.msg,success:envelope.success,data};
-      const normalized=normalizeCoinGlassWebHeatmap(payload);
-      return {...normalized,sourceUrl:buildCoinGlassHeatmapPageUrl(parsed.url,range),capturedAt:new Date(capturedAtMs)};
-    }finally{clearTimeout(timeout);}
-  }
 }
 
 export function normalizeCoinGlassWebHeatmap(payload:CoinGlassWebHeatmapPayload){

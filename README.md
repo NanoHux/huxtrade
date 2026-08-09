@@ -39,7 +39,7 @@ docker compose run --rm migrate pnpm db:seed
 docker compose up -d --build api web
 ```
 
-打开 `http://localhost:3000`。CoinGlass 不再需要付费 API Key：BTC 可直接采集；部分非 BTC 币种需要从用户主动导出的 CoinGlass HAR 同时导入网页会话头及其绑定的浏览器指纹。成功缓存 Heatmap 后再启动 `market-collector` 与 `signal-engine`。Telegram 可在系统设置中测试并保存。第一版所有展示时间固定为 UTC+8，完整命令见 macOS 运行说明。
+打开 `http://localhost:3000`。CoinGlass 不再需要付费 API Key，也不再依赖逆向工程的加密协议——它会不定期更换响应加密版本（已实测由 v0 变为 v1），所以改为驱动一个真实登录的 Chrome：由 CoinGlass 网页自己的 JS 完成解密，Agent 只读取结果，天然不受其加密算法变化影响。首次使用需在该 Chrome 里手动登录一次 CoinGlass 账号（`COINGLASS_ADAPTER_MODE=browser`；若 Playwright 自启动的 Profile 被 Google 登录判定为"不安全浏览器"拦截，改用 `COINGLASS_CDP_URL` 连接自行启动的调试端口 Chrome，见 macOS 运行说明）。成功缓存 Heatmap 后再启动 `market-collector` 与 `signal-engine`。Telegram 可在系统设置中测试并保存。第一版所有展示时间固定为 UTC+8，完整命令见 macOS 运行说明。
 
 本地开发：
 
@@ -56,7 +56,7 @@ pnpm build
 apps/web                  Dashboard 与管理台
 apps/api                  REST API、控制面、状态聚合
 apps/market-collector     Binance/CoinGlass 采集与指标快照
-apps/coinglass-agent      免费网页 Heatmap 请求、解密与数据库缓存
+apps/coinglass-agent      驱动真实登录 Chrome 读取免费网页 Heatmap（页面自解密）并写入数据库缓存
 apps/signal-engine        15 分钟信号、风险门、订单计划
 apps/variational-agent    会话、提交、保护单、对账适配边界
 apps/telegram-worker      Outbox 通知与故障状态
@@ -74,7 +74,7 @@ packages/shared-types     跨服务类型
 - 数据异常会暂停单币，且只能后台手动恢复；不会因为重启自动清除。
 - Variational 登录失效时分析可继续，但信号标记为不可执行，恢复后不补单。
 - 平台返回超时或状态不明确时进入 `UNKNOWN`，继续占用订单上限；每 30 秒以 Variational 权威状态同步订单、持仓与成交。
-- `.env` 与 `*.har` 被 Git 忽略；CoinGlass Cookie 不会被程序读取，按需导入的 `obe` 会话头及白名单浏览器指纹只保存在本机 `.env`，不会写入 PostgreSQL 或日志；设置页保存 Telegram 密钥前会发送真实测试消息。
+- `.env` 被 Git 忽略；CoinGlass 的登录态只存在于 coinglass-agent 自己打开的 Chrome Profile（`coinglass-profile/`，同样被忽略）里，不经过 `.env`、不写入 PostgreSQL 或日志；设置页保存 Telegram 密钥前会发送真实测试消息。
 
 详见 [需求验收映射](docs/REQUIREMENTS_TRACEABILITY.md) 与 [Windows Server 运行说明](docs/OPERATIONS_WINDOWS.md)。
 macOS 首次安装、Colima 自启动和安全启动顺序见 [macOS 运行说明](docs/OPERATIONS_MACOS.md)。

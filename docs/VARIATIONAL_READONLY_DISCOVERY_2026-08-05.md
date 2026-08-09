@@ -82,6 +82,8 @@ The application also connects WebSocket channels named `/events`, `/prices`, and
 
 These endpoints must remain disabled until exact response/error schemas and idempotency behavior are verified with separately approved tests.
 
+**Update 2026-08-06 — `set_leverage` enabled for auto-alignment.** The operator explicitly authorized automatic leverage correction on this dedicated test-funds account, with the goal of full automation (order-time leverage mismatches — e.g. `XPL` open at 10x, strategy expects 5x — had been failing every order closed instead of self-healing). Since the response schema is still unverified, `verifyLeverage` does not trust `set_leverage`'s response body at all: it calls the mutation, then re-reads leverage through the already-verified `POST /api/settlement_pools/leverage` path, and only proceeds if that re-read confirms the platform actually applied the requested value. It still throws (fails closed) if the re-read doesn't match — the change adds a self-correct attempt in front of the existing safety check, it doesn't remove the check. See `apps/variational-agent/src/omni-adapter.ts` (`verifyLeverage`/`currentLeverage`).
+
 ## Remaining discovery gaps
 
 1. Sanitized raw JSON schemas for account, positions, pending orders, trades, transfers, and quotes.

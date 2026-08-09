@@ -4,7 +4,7 @@ import { BinanceFuturesClient } from "@huxtrade/exchange-clients";
 import { fixedRules } from "@huxtrade/config";
 import { classifyBtcRegime, cvdAnomaly, fundingAnomaly, oiAnomaly } from "@huxtrade/indicators";
 import type { HeatmapRegion } from "@huxtrade/shared-types";
-import { scanningPaused } from "./control.js";
+import { cvdBinsFromCandles, isRetryablePause, scanningPaused } from "./control.js";
 
 const binance = new BinanceFuturesClient();
 const sleep = (ms:number) => new Promise((resolve) => setTimeout(resolve, ms));
@@ -66,11 +66,17 @@ async function metricValues(assetId:string,metric:BaselineMetric,currentAt:Date,
   return rows.rows.reverse().map((row)=>Number(row.value));
 }
 
-async function requestHeatmapRefresh(closedAt:Date,heatmapRange:string){
+async function requestHeatmapRefresh(closedAt:Date,heatmapRange:string,assetCount:number){
   const requestId=randomUUID(),requestedAt=new Date();
   await query(`INSERT INTO app_state(key,value) VALUES('coinglass_refresh_request',$1)
     ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,[JSON.stringify({requestId,requestedAt:requestedAt.toISOString(),closedAt:closedAt.toISOString(),heatmapRange})]);
-  const deadline=Date.now()+45_000;
+  // CoinGlass Agent captures assets sequentially with a deliberate pause
+  // between each (crash prevention), so a fixed wait budget here falls behind
+  // as the whitelist grows — a 45s constant already races the agent at just
+  // 13 assets (observed: 62.8s for a full pass). Scale with the current
+  // asset count instead of guessing a bigger constant; the 15-minute scan
+  // cadence has plenty of room even at the 50-asset spec ceiling (~9min).
+  const deadline=Date.now()+Math.max(45_000,assetCount*10_000+20_000);
   while(Date.now()<deadline){
     const result=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='coinglass_refresh_result'")).rows[0]?.value;
     if(result?.requestId===requestId)return requestedAt;
@@ -84,9 +90,9 @@ async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closed
   const id=String(asset.id),symbol=String(asset.binance_symbol);
   try{
     await prewarmAsset(asset);
-    const [price,oi,funding,trades,heatmapResult]=await Promise.all([
+    const [price,oi,funding,candles5m,heatmapResult]=await Promise.all([
       binance.latestPrice(symbol),binance.openInterest(symbol),binance.fundingHistory(symbol,8),
-      binance.aggregateTrades(symbol,closedAt.getTime()-quarterMs,closedAt.getTime()-1),
+      binance.klinesRange(symbol,"5m",closedAt.getTime()-quarterMs,closedAt.getTime()-1),
       query<{regions:HeatmapRegion[];captured_at:Date}>("SELECT regions,captured_at FROM coinglass_heatmaps WHERE asset_id=$1 AND heatmap_range=$2",[id,heatmapRange])
     ]);
     const heatmapRow=heatmapResult.rows[0];
@@ -94,10 +100,15 @@ async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closed
     if(!heatmapRow||Date.now()-heatmapCapturedAt>fixedRules.heatmapStaleMs||heatmapCapturedAt<heatmapNotBefore.getTime())throw new Error(`CoinGlass ${heatmapRange} Heatmap was not refreshed for this scan`);
     const heatmap={regions:Array.isArray(heatmapRow.regions)?heatmapRow.regions:[]};
     if(!heatmap.regions.length)throw new Error(`CoinGlass ${heatmapRange} Heatmap cache contains no eligible regions`);
-    const cvdBins=trades.reduce<number[]>((bins,trade)=>{
-      const index=Math.min(2,Math.max(0,Math.floor((trade.T-(closedAt.getTime()-quarterMs))/(5*60_000))));
-      bins[index]=(bins[index]??0)+(trade.m?-1:1)*Number(trade.p)*Number(trade.q);return bins;
-    },[0,0,0]);
+    // Identical quantity to the per-trade sum this replaced — taker-buy quote
+    // volume minus taker-sell — and identical to the formula the 30-day
+    // CVD_15M baseline is built from in prewarmAsset. Summing aggregate trades
+    // paginated 1000 at a time and cost tens to hundreds of Binance requests
+    // per scan on a high-volume asset, which is what pushed the whole system
+    // past the 2400/min IP limit; three 5m candles cost one. Using the same
+    // source as the baseline also removes the risk of measuring the live value
+    // and its own baseline with two different rulers.
+    const cvdBins=cvdBinsFromCandles(candles5m,closedAt.getTime()-quarterMs,closedAt.getTime());
     const cvd=cvdBins.reduce((sum,value)=>sum+value,0);
     const fundingValue=Number(funding.at(-1)?.fundingRate??0);
     const [oiValues,cvdValues,fundingValues]=await Promise.all([
@@ -114,9 +125,19 @@ async function collectAsset(asset:Record<string,unknown>,btcRegime:string,closed
       ON CONFLICT(asset_id,closed_at) DO UPDATE SET scan_run_id=EXCLUDED.scan_run_id,price=EXCLUDED.price,oi_value=EXCLUDED.oi_value,oi_change_1h=EXCLUDED.oi_change_1h,oi_z=EXCLUDED.oi_z,oi_passed=EXCLUDED.oi_passed,cvd_value=EXCLUDED.cvd_value,cvd_z=EXCLUDED.cvd_z,cvd_passed=EXCLUDED.cvd_passed,cvd_direction=EXCLUDED.cvd_direction,funding_value=EXCLUDED.funding_value,funding_change_4h=EXCLUDED.funding_change_4h,funding_z=EXCLUDED.funding_z,funding_change_z=EXCLUDED.funding_change_z,funding_passed=EXCLUDED.funding_passed,heatmap=EXCLUDED.heatmap,heatmap_passed=EXCLUDED.heatmap_passed,btc_regime=EXCLUDED.btc_regime,warmup_ready=EXCLUDED.warmup_ready,inputs=EXCLUDED.inputs`,[
       id,scanRunId,closedAt,price,oi.value,oiResult.value,oiResult.zScore,oiResult.passed,cvd,cvdResult.zScore,cvdResult.passed,cvdResult.direction>0?"LONG":cvdResult.direction<0?"SHORT":null,
       fundingResult.value,fundingResult.change4h,fundingResult.currentZ,fundingResult.changeZ,fundingResult.passed,JSON.stringify(heatmap.regions),heatmap.regions.length>0,btcRegime,warmupReady,
-      JSON.stringify({oiTime:oi.time,tradeCount:trades.length,baselineSamples:{oi:oiResult.sampleCount,cvd:cvdResult.sampleCount,funding:fundingResult.sampleCount},fundingScore:fundingResult.score,heatmapRange,heatmapCapturedAt:new Date(heatmapRow.captured_at).toISOString()})
+      JSON.stringify({oiTime:oi.time,cvdCandleCount:candles5m.length,cvdSource:"BINANCE_5M_TAKER_VOLUME",baselineSamples:{oi:oiResult.sampleCount,cvd:cvdResult.sampleCount,funding:fundingResult.sampleCount},fundingScore:fundingResult.score,heatmapRange,heatmapCapturedAt:new Date(heatmapRow.captured_at).toISOString()})
     ]);
     await query("UPDATE assets SET last_updated_at=now(),updated_at=now() WHERE id=$1",[id]);
+    // Only assets paused for a retryable data/prewarm failure ever reach this
+    // point paused=true (the scan query below excludes every other pause
+    // reason), so a clean run here is proof the underlying fetch problem is
+    // gone — safe to lift automatically. Pauses from real trading-state risk
+    // (missing protection, ambiguous reconciliation) never take this path and
+    // still require a human to look and clear them by hand.
+    if(Boolean(asset.paused)){
+      await query("UPDATE assets SET paused=false,pause_reason=null,updated_at=now() WHERE id=$1",[id]);
+      await query("INSERT INTO outbox(topic,payload) VALUES('notification.asset_resumed',$1)",[JSON.stringify({asset:String(asset.code),previousReason:String(asset.pause_reason??"")})]);
+    }
     return true;
   }catch(error){
     const reason=error instanceof Error?error.message:String(error);
@@ -139,23 +160,29 @@ async function scan(){
     if(scanningPaused(globalState.rows[0]?.value,riskState.rows[0]?.value)){await recordHealth("market-collector",true);return;}
     const [daily,fourHour]=await Promise.all([binance.klines("BTCUSDT","1d",260),binance.klines("BTCUSDT","4h",300)]);
     await recordHealth("binance",true);binanceHealthy=true;
-    const [assets,strategy]=await Promise.all([query("SELECT * FROM assets WHERE collect_enabled=true AND paused=false ORDER BY code"),query<{heatmap_range:string}>("SELECT heatmap_range FROM strategies WHERE enabled=true LIMIT 1")]);
+    // Assets paused for a transient DATA_ERROR/PREWARM_ERROR are retried every
+    // scan so they self-heal once Binance/CoinGlass is reachable again; every
+    // other pause reason (missing protection, ambiguous reconciliation, a
+    // human's manual pause) is a real trading-state risk and stays excluded
+    // until someone clears it deliberately.
+    const [allAssets,strategy]=await Promise.all([query<Record<string,unknown>>("SELECT * FROM assets WHERE collect_enabled=true ORDER BY code"),query<{heatmap_range:string}>("SELECT heatmap_range FROM strategies WHERE enabled=true LIMIT 1")]);
+    const assetRows=allAssets.rows.filter((row)=>!row.paused||isRetryablePause(row.pause_reason as string|null));
     const previous=(await query<{btc_regime:string}>("SELECT btc_regime FROM indicator_snapshots WHERE btc_regime IS NOT NULL ORDER BY closed_at DESC LIMIT 1")).rows[0]?.btc_regime as "BULL"|"BEAR"|"RANGE"|"TRANSITION"|undefined;
     const dailyClosed=daily.filter((candle)=>candle.openTime+24*60*60_000<=closedAt.getTime());
     const fourHourClosed=fourHour.filter((candle)=>candle.openTime+4*60*60_000<=closedAt.getTime());
     const btc=classifyBtcRegime(dailyClosed,fourHourClosed,previous);
     const run=await query<{id:string}>(`INSERT INTO scan_runs(closed_at,btc_regime,btc_context,asset_count) VALUES($1,$2,$3,$4)
-      ON CONFLICT(closed_at) DO UPDATE SET started_at=now(),completed_at=null,status='RUNNING',error=null RETURNING id`,[closedAt,btc.regime,JSON.stringify(btc),assets.rowCount??0]);
+      ON CONFLICT(closed_at) DO UPDATE SET started_at=now(),completed_at=null,status='RUNNING',error=null RETURNING id`,[closedAt,btc.regime,JSON.stringify(btc),assetRows.length]);
     scanRunId=run.rows[0]!.id;
     let success=0;
     const heatmapRange=strategy.rows[0]?.heatmap_range??"24h";
-    const heatmapNotBefore=await requestHeatmapRefresh(closedAt,heatmapRange);
-    const pending=[...assets.rows] as Record<string,unknown>[];
+    const heatmapNotBefore=await requestHeatmapRefresh(closedAt,heatmapRange,assetRows.length);
+    const pending=[...assetRows];
     const workers=Array.from({length:Math.min(5,pending.length)},async()=>{
       while(pending.length){const asset=pending.shift();if(asset&&await collectAsset(asset,btc.regime,closedAt,scanRunId!,heatmapRange,heatmapNotBefore))success+=1;}
     });
     await Promise.all(workers);
-    const failure=(assets.rowCount??0)-success;
+    const failure=assetRows.length-success;
     await query("UPDATE scan_runs SET completed_at=now(),success_count=$1,failure_count=$2,status=$3 WHERE id=$4",[success,failure,failure?"PARTIAL":"COMPLETED",scanRunId]);
     await recordHealth("market-collector",failure===0,failure?`${failure} asset(s) paused during scan`:undefined,false);
   }catch(error){

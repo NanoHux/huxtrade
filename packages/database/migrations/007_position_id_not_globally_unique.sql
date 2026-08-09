@@ -1,0 +1,15 @@
+-- Variational's position id is `company:pool_location:instrument_type:asset:
+-- funding_interval:settlement_asset` (see OmniBrowserAdapter.positionSnapshot)
+-- — a stable identifier per account+instrument, not a fresh id per position
+-- lifecycle. Every time an asset that was previously traded (and closed) gets
+-- a new position, Variational reports the exact same id as last time, so a
+-- global UNIQUE constraint on it collides against the earlier, now-closed
+-- row the moment persistPlatformDetails tries to insert a new positions row
+-- for the new order. That collision throws out of the whole reconciliation
+-- transaction every tick, which — since reconcileOpenOrders has no per-order
+-- try/catch — silently aborts reconciliation for every order queued after
+-- the colliding one. The real uniqueness guarantee this table needs is
+-- order_id (already enforced below); platform_position_id is written for
+-- reference only and was never queried back, so dropping this constraint
+-- has no other effect.
+ALTER TABLE positions DROP CONSTRAINT IF EXISTS positions_platform_position_id_key;

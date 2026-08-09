@@ -7,6 +7,8 @@
     "@huxtrade/config": "workspace:*",
     "@huxtrade/database": "workspace:*",
     "@huxtrade/exchange-clients": "workspace:*",
+    "@huxtrade/shared-types": "workspace:*",
+    "@huxtrade/strategy-engine": "workspace:*",
     "fastify": "^5.4.0",
     "zod": "^3.25.0"
   },

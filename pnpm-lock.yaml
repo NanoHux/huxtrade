@@ -47,6 +47,12 @@ importers:
       '@huxtrade/exchange-clients':
         specifier: workspace:*
         version: link:../../packages/exchange-clients
+      '@huxtrade/shared-types':
+        specifier: workspace:*
+        version: link:../../packages/shared-types
+      '@huxtrade/strategy-engine':
+        specifier: workspace:*
+        version: link:../../packages/strategy-engine
       fastify:
         specifier: ^5.4.0
         version: 5.11.2
@@ -65,6 +71,9 @@ importers:
       '@huxtrade/exchange-clients':
         specifier: workspace:*
         version: link:../../packages/exchange-clients
+      playwright-core:
+        specifier: ^1.54.0
+        version: 1.62.1
 
   apps/market-collector:
     dependencies:
@@ -119,6 +128,9 @@ importers:
       '@huxtrade/database':
         specifier: workspace:*
         version: link:../../packages/database
+      '@huxtrade/exchange-clients':
+        specifier: workspace:*
+        version: link:../../packages/exchange-clients
       '@huxtrade/strategy-engine':
         specifier: workspace:*
         version: link:../../packages/strategy-engine

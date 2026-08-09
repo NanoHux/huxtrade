@@ -1,0 +1,13 @@
+-- The resting limit entry parameters (entry band, confluence merge distance,
+-- replace hysteresis, bias persistence, armed-asset cap, candidate weights)
+-- become per-strategy settings so they can be tuned from the management UI
+-- without a redeploy.
+--
+-- '{}' means "every parameter takes its default" — resolveRestingEntry() in
+-- strategy-engine layers whatever keys are present over fixedRules.restingEntry,
+-- so existing strategies need no backfill and a default that changes in code
+-- still reaches any strategy that never overrode it.
+--
+-- maxWorkingOrdersPerAsset is deliberately NOT here: one working order per
+-- asset is a spec red line, not a tuning knob.
+ALTER TABLE strategies ADD COLUMN IF NOT EXISTS resting_entry jsonb NOT NULL DEFAULT '{}'::jsonb;

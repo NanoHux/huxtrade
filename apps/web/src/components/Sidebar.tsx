@@ -2,7 +2,7 @@
 import Link from "next/link";
 import { usePathname } from "next/navigation";
 const links=[
- ["/","⌁","总览"],["/assets","◫","币种管理"],["/strategies","◇","策略管理"],["/orders","⇄","订单与持仓"],["/statistics","⌗","统计"],["/system","⚙","系统与健康"]
+ ["/","⌁","总览"],["/assets","◫","币种管理"],["/strategies","◇","策略管理"],["/orders","⇄","订单与持仓"],["/resting","◷","挂单看板"],["/statistics","⌗","统计"],["/system","⚙","系统与健康"]
 ];
 export function Sidebar(){const pathname=usePathname();return <aside className="sidebar">
  <div className="brand"><span className="brandMark">V</span><div><b>VARIATIONAL</b><small>MARKET SYSTEM</small></div></div>

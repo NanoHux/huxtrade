@@ -56,10 +56,16 @@ export function MarketChart({symbols=["BTCUSDT"]}:{symbols?:string[]}){
         const lines:Array<Record<string,unknown>>=[];
         for(const order of payload.orders){
           const colour=order.direction==="LONG"?"#61a9ff":"#8d7bff";
+          // Say which order a line belongs to: several assets can hold a
+          // resting order and a filled position at once, and unlabelled
+          // duplicates of "SL" are indistinguishable once they overlap.
+          const side=order.direction==="LONG"?"多":"空";
+          const tag=order.state==="FILLED_OPEN"?`${side}持仓`:`${side}挂单`;
+          const price=(value:string)=>Number(value).toLocaleString(undefined,{maximumFractionDigits:6});
           lines.push(
-            {name:"Entry",yAxis:Number(order.entry_price),lineStyle:{color:colour},label:{formatter:`入场 ${Number(order.entry_price).toLocaleString()}`,fontSize:9}},
-            {name:"TP",yAxis:Number(order.take_profit),lineStyle:{color:"#35d29a",type:"dashed"},label:{formatter:"TP",fontSize:9}},
-            {name:"SL",yAxis:Number(order.stop_loss),lineStyle:{color:"#f0655b",type:"dashed"},label:{formatter:"SL",fontSize:9}}
+            {name:"Entry",yAxis:Number(order.entry_price),lineStyle:{color:colour},label:{formatter:`${tag} ${price(order.entry_price)}`,fontSize:9}},
+            {name:"TP",yAxis:Number(order.take_profit),lineStyle:{color:"#35d29a",type:"dashed"},label:{formatter:`TP ${price(order.take_profit)}`,fontSize:9}},
+            {name:"SL",yAxis:Number(order.stop_loss),lineStyle:{color:"#f0655b",type:"dashed"},label:{formatter:`SL ${price(order.stop_loss)}`,fontSize:9}}
           );
         }
 

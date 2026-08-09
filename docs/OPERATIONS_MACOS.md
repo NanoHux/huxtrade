@@ -1,6 +1,6 @@
 # macOS 运行说明
 
-本项目在 macOS 上采用 Colima 提供 Docker 兼容运行时；PostgreSQL、API、Web、CoinGlass 免费网页 Agent 和无浏览器 Worker 在容器内运行，Variational Agent 使用本机 Chrome/Profile。
+本项目在 macOS 上采用 Colima 提供 Docker 兼容运行时；PostgreSQL、API、Web 和无浏览器 Worker 在容器内运行，Variational Agent 与 CoinGlass Agent 都需要驱动真实浏览器，因此原生运行并使用本机 Chrome/Profile。
 
 ## 首次安装
 
@@ -44,64 +44,69 @@ Dashboard 位于 `http://localhost:3000`。上述安全启动不运行 CoinGlass
 
 ## 开启市场分析
 
-CoinGlass 免费网页 Heatmap 不需要付费 API Key，也不需要让程序读取浏览器 Cookie。先在 `.env` 中启用免费网页适配器：
+CoinGlass 免费网页 Heatmap 不需要付费 API Key。它的响应是加密的，且加密版本会不定期更换（已实测从 `v0` 变为 `v1`，导致早期逆向实现的 AES 客户端直接失效）。因此 Agent 不再自己解密：它驱动一个真实登录的 Chrome 打开 Heatmap 页面，由 CoinGlass 自己的前端 JS 完成解密，Agent 只 hook `JSON.parse` 读出解密后的结果——这样无论 CoinGlass 之后怎么改加密算法都不受影响。
+
+与 Variational Agent 一样，coinglass-agent 需要访问真实浏览器，所以在 Mac 上原生运行，不在 Docker 容器内（容器默认 compose 也已经不再启动它）。先在 `.env` 中启用：
 
 ```dotenv
-COINGLASS_ADAPTER_MODE=free-web
-COINGLASS_OBE=
-COINGLASS_BROWSER_HEADERS_B64=
-COINGLASS_AGENT_POLL_MS=15000
-COINGLASS_REFRESH_MS=600000
+COINGLASS_ADAPTER_MODE=browser
+COINGLASS_PROFILE_PATH=./coinglass-profile
+COINGLASS_BROWSER_EXECUTABLE=
+COINGLASS_CDP_URL=
 ```
 
-BTC 可直接烟测：
+BTC 不需要登录，可直接烟测（首次运行会用 Playwright 自己启动一个可见的 Chrome 窗口，使用 `COINGLASS_PROFILE_PATH` 指定的 Profile）：
 
 ```bash
 pnpm --filter @huxtrade/coinglass-agent smoke \
   'https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC&type=pair'
 ```
 
-CoinGlass 当前对部分非 BTC 币种要求登录网页请求中的 `obe` 会话头。此时在已登录的日常 Chrome 中打开开发者工具并按以下步骤导出：
-
-1. 打开 **Network**，过滤 `liqHeatMap`。
-2. 刷新 Heatmap 页面或切换一次币种，确认出现 `capi.coinglass.com/api/index/v2/liqHeatMap` 请求。
-3. 在请求列表中右键，选择 **Save all as HAR with content**，保存到项目根目录。
-4. 运行下面的导入命令。程序会同时读取 `obe` 和它绑定的浏览器指纹，先用 ETH 实时探测；探测成功后才把两者编码写入 `.env`，不会输出其值。
+非 BTC 币种需要登录 CoinGlass 账号。**注意**：Google 的登录会把 Playwright 自己启动的浏览器判定为"不安全浏览器"并拒绝登录（Variational Agent 也有同样的问题）。遇到这种情况，改成自己手动启动一个带调试端口的 Chrome，再让 Agent 附加上去，而不是让 Playwright 自己拉起浏览器：
 
 ```bash
-pnpm --filter @huxtrade/coinglass-agent import-har ./你的文件.har
+/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
+  --remote-debugging-port=9223 \
+  --user-data-dir=/Users/hux/Desktop/huxtrade/coinglass-profile \
+  'https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC&type=pair'
 ```
 
-HAR 含会话敏感信息，已被 `.gitignore` 排除，不要提交或分享；验证完成后可由你自行安全删除。导入会更新根目录 `.env`，API 与 Agent 读取的是容器启动时环境变量，因此导入后先重建这两个服务：
+在这个窗口里正常登录一次 CoinGlass 账号，然后把调试端口写进 `.env`（只允许回环地址）：
 
-```bash
-docker compose up -d --build --force-recreate api coinglass-agent
+```dotenv
+COINGLASS_CDP_URL=http://127.0.0.1:9223
 ```
 
-随后做 BTC、ETH、SOL 真实数据烟测：
+随后做 BTC、ETH、SOL、XRP 真实数据烟测（Agent 会连接到上面这个已登录的 Chrome，不再自己启动新的）：
 
 ```bash
 pnpm --filter @huxtrade/coinglass-agent smoke \
   'https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=BTC&type=pair' \
   'https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=ETH&type=pair' \
-  'https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=SOL&type=pair'
+  'https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=SOL&type=pair' \
+  'https://www.coinglass.com/pro/futures/LiquidationHeatMap?coin=XRP&type=pair'
 ```
 
-每行应返回 `regionCount` 和最强三个价格区。然后常驻启动容器化 Agent：
+每行应返回 `regionCount` 和最强三个价格区。确认无误后原生常驻启动 Agent（`DATABASE_URL` 需要指向宿主机发布的端口，而不是容器内部主机名）：
 
 ```bash
-docker compose up -d --build coinglass-agent
-docker compose logs --tail 100 -f coinglass-agent
+ENV_FILE_OVERRIDE=false \
+DATABASE_URL=postgres://huxtrade:huxtrade@127.0.0.1:5432/huxtrade \
+pnpm --filter @huxtrade/coinglass-agent start
 ```
 
-Agent 按资产保存的 CoinGlass URL 请求、解密并规范化 Heatmap，再写入 `coinglass_heatmaps`。协议若变化、响应无法解密或数据过期都会失败关闭并阻止交易。Dashboard 的系统页显示 `DATA READY` 且每个币种出现 Heatmap 年龄后，再启动：
+Agent 启动后先同步处理 API 转发过来的一次性抓取请求（新增币种校验、系统设置页「重新测试」都是通过 Postgres `app_state` 的 `coinglass_probe_request`/`coinglass_probe_result` 握手转给这个原生进程完成的，因为容器内的 `api` 服务连不到宿主机 Chrome），再按运行策略的 12h/24h/3d/7d/30d 周期定期采集全部白名单币种，写入 `coinglass_heatmaps`。页面加载超时、还没登录或数据过期都会失败关闭并阻止交易。Dashboard 的系统页显示 `DATA READY` 且每个币种出现 Heatmap 年龄后，再启动：
 
 ```bash
 docker compose up -d --build market-collector signal-engine
 docker compose logs --tail 200 -f market-collector signal-engine
 ```
 
-新增币种时，在资产页粘贴该币种的 Model 1、Pair 模式链接。系统校验域名、路径、`coin` 参数，并实际取得 Heatmap 后才保存，同时强制要求它与 Binance 永续合约一致；同一份有效会话可跨币种复用，CoinGlass Agent 随后按运行策略的 12h/24h/3d/7d/30d 周期采集。若登录会话失效或 Chrome 指纹变化，重新导出一次包含 `liqHeatMap` 请求的 HAR、执行 `import-har`，再重建 API 与 Agent 即可更新。会话拒绝后 Agent 不会每 15 秒重复请求或重复写入同一永久错误。
+新增币种时，在资产页粘贴该币种的 Model 1、Pair 模式链接。系统校验域名、路径、`coin` 参数，并通过上述握手实际取得一次 Heatmap 后才保存，同时强制要求它与 Binance 永续合约一致；同一个已登录 Chrome 可跨币种复用。若登录会话失效，在 Agent 使用的那个 Chrome 窗口里重新登录一次即可，不需要重启任何服务、也不需要导出 HAR。
+
+### Linux 部署
+
+Linux 上 coinglass-agent 走 `linux-agent` compose profile 容器化运行，浏览器 Profile 用 `coinglass_profile` 持久化 Volume；首次登录同样需要通过远程桌面在该容器内的浏览器里手动完成一次。
 
 Telegram 配置经页面真实测试并保存后，可启动或重启 Worker：
 
@@ -156,9 +161,11 @@ tail -f ~/Library/Logs/HuxTrade/variational-agent.err.log
 
 ```bash
 docker compose ps
-docker compose logs --tail 200 api web coinglass-agent market-collector signal-engine telegram-worker
+docker compose logs --tail 200 api web market-collector signal-engine telegram-worker
 colima status
 ```
+
+coinglass-agent 和 variational-agent 在 Mac 上都原生运行（不在 `docker compose ps` 里），日志直接看各自终端输出或 `nohup` 重定向的文件。
 
 停止项目但保留数据库：
 

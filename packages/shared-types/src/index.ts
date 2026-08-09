@@ -1,7 +1,7 @@
 export const orderStates = [
   "CREATED_LOCAL", "SUBMITTING", "PENDING_ENTRY", "FILLED_OPEN", "CLOSED_TP",
-  "CLOSED_SL", "LIQUIDATED", "SUBMISSION_FAILED", "CANCELLED_EXTERNALLY",
-  "UNKNOWN", "RECONCILIATION_REQUIRED"
+  "CLOSED_SL", "LIQUIDATED", "CLOSED_REVERSED", "SUBMISSION_FAILED", "CANCELLED_EXTERNALLY",
+  "CANCELLED_REPLACED", "UNKNOWN", "RECONCILIATION_REQUIRED"
 ] as const;
 export type OrderState = (typeof orderStates)[number];
 export type Direction = "LONG" | "SHORT";
@@ -40,6 +40,50 @@ export interface Asset {
   };
 }
 
+/**
+ * Per-strategy overrides for the resting limit entry model. Distances are in
+ * 1h ATR so they mean the same thing on every asset. Anything omitted falls
+ * back to fixedRules.restingEntry — see resolveRestingEntry in strategy-engine.
+ */
+export interface RestingEntrySettings {
+  /** Entry band, nearest and farthest, in 1h ATR behind the reference price. */
+  entryBandAtrMin: number;
+  entryBandAtrMax: number;
+  /** How far in front of the structure the order sits. */
+  entryOffsetAtr: number;
+  /** Candidates closer than this are one structure and their scores add. */
+  confluenceMergeAtr: number;
+  /** Hysteresis: the level must move more than this before the order is replaced. */
+  replaceThresholdAtr: number;
+  /** How many 15m scans an armed direction bias survives without a refresh. */
+  biasPersistenceScans: number;
+  /** How many counter-direction passes must accumulate before an armed bias actually flips. */
+  flipConfirmationScans: number;
+  /** Cap on simultaneously armed assets, ranked by signal strength. */
+  maxArmedAssets: number;
+  /** Fixed scores for the non-heatmap candidates; heatmap scores on its region percentile. */
+  swingScore: number;
+  emaScore: number;
+  /** Score bonus for the structure a working order already sits on, so a marginal rival cannot displace it. */
+  incumbentScoreBonus: number;
+  /** Refuse signals that trade WITH a 24h move of at least this size — shorts into a pump, longs into a dump. 0 disables. */
+  extremeMoveBlockPercent: number;
+  /** Losing stop-outs in one direction that halt further arming of it. 0 disables the circuit breaker. */
+  lossStreakCount: number;
+  /** How far back the losing stop-outs are counted, in hours. */
+  lossStreakWindowHours: number;
+  /** How long that direction stays halted after the streak, in hours. */
+  lossStreakHaltHours: number;
+  /** Unrealised profit, in stop-widths, at which part of the position is taken off. 0 disables scaling out. */
+  scaleOutTriggerR: number;
+  /** Share of the position closed when the trigger is reached; the remainder runs to the unchanged target. */
+  scaleOutFraction: number;
+  /** Skip the scale-out when the stop is narrower than this share of price, where the spread would eat the gain. */
+  scaleOutMinStopPercent: number;
+  /** How far beyond entry, in stop-widths, the surviving half's breakeven stop sits. */
+  breakevenOffsetR: number;
+}
+
 export interface Strategy {
   id: string;
   name: string;
@@ -49,6 +93,9 @@ export interface Strategy {
   conditions: ConditionType[];
   heatmapRange: "12h" | "24h" | "3d" | "7d" | "30d";
   maxOrdersPerSide: number;
+  /** Which entry model this strategy executes. The shadow ledger is written either way. */
+  entryKind: EntryKind;
+  restingEntry: RestingEntrySettings;
 }
 
 export interface ConditionResult {
@@ -80,9 +127,37 @@ export interface SignalEvaluation {
   rejectionReasons: string[];
 }
 
+/**
+ * `MARKET_ON_SIGNAL` is the original path: the signal fires and the entry is
+ * submitted at the current price. `RESTING_LIMIT` decouples direction from
+ * execution — the signal only arms a bias, and the entry waits at a
+ * structural level chosen by chooseEntryLevel.
+ */
+export type EntryKind = "MARKET_ON_SIGNAL" | "RESTING_LIMIT";
+
+export type EntryCandidateSource = "HEATMAP" | "SWING" | "EMA";
+
+/** Why a resting entry sits where it does — persisted for the shadow-mode audit ledger. */
+export interface RestingEntryProvenance {
+  sources: EntryCandidateSource[];
+  score: number;
+  level: number;
+  /** Scan reference price the entry band was measured from. */
+  referencePrice: number;
+  atr1h: number;
+  bandNear: number;
+  bandFar: number;
+  region?: HeatmapRegion;
+  swing?: number;
+  ema?: number;
+}
+
 export interface OrderPlan {
   idempotencyKey: string;
+  /** Binance symbol — the identity used for indicators, keys and display. */
   symbol: string;
+  /** Variational's own ticker when it differs from the Binance base (LIT trades as LIGHTER). */
+  venueSymbol?: string;
   direction: Direction;
   entryPrice: number;
   stopLoss: number;
@@ -92,6 +167,8 @@ export interface OrderPlan {
   leverage: number;
   notionalUsdc: number;
   heatmapTarget?: HeatmapRegion;
+  entryKind?: EntryKind;
+  entryProvenance?: RestingEntryProvenance;
 }
 
 /** Active order states hold a symbol/side slot per spec 6.3. */
@@ -162,4 +239,4 @@ export interface DashboardSnapshot {
 }
 
 export const isTerminalOrderState = (state: OrderState) =>
-  ["CLOSED_TP", "CLOSED_SL", "LIQUIDATED", "SUBMISSION_FAILED", "CANCELLED_EXTERNALLY"].includes(state);
+  ["CLOSED_TP", "CLOSED_SL", "LIQUIDATED", "CLOSED_REVERSED", "SUBMISSION_FAILED", "CANCELLED_EXTERNALLY", "CANCELLED_REPLACED"].includes(state);

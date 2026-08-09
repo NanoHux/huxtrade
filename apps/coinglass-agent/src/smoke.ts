@@ -1,8 +1,9 @@
 import { getConfig } from "@huxtrade/config";
-import { CoinGlassFreeWebClient,type CoinGlassHeatmapRange } from "@huxtrade/exchange-clients";
+import { type CoinGlassHeatmapRange } from "@huxtrade/exchange-clients";
+import { CoinGlassBrowserClient } from "./browser-capture.js";
 
 const config=getConfig();
-const collector=new CoinGlassFreeWebClient(undefined,undefined,undefined,config.COINGLASS_OBE,config.COINGLASS_BROWSER_HEADERS_B64);
+const collector=new CoinGlassBrowserClient(config);
 const range=(process.env.COINGLASS_SMOKE_RANGE??"24h") as CoinGlassHeatmapRange;
 const urls=process.argv.slice(2);
 if(!urls.length)throw new Error("Pass one or more CoinGlass Model 1 Pair Heatmap URLs");
@@ -17,4 +18,8 @@ for(const url of urls){
     console.error(JSON.stringify({ok:false,url,range,error:error instanceof Error?error.message:String(error)}));
   }
 }
-if(failures)process.exitCode=1;
+await collector.close();
+// Playwright's CDP transport can leave an open WebSocket handle even after
+// close(), keeping the event loop alive indefinitely for a CLI tool that
+// should have exited already.
+process.exit(failures?1:0);

@@ -12,6 +12,9 @@
     "macos:variational:install": "node scripts/macos/variational-launchagent.mjs install",
     "macos:variational:status": "node scripts/macos/variational-launchagent.mjs status",
     "macos:variational:uninstall": "node scripts/macos/variational-launchagent.mjs uninstall",
+    "macos:coinglass:install": "node scripts/macos/coinglass-launchagent.mjs install",
+    "macos:coinglass:status": "node scripts/macos/coinglass-launchagent.mjs status",
+    "macos:coinglass:uninstall": "node scripts/macos/coinglass-launchagent.mjs uninstall",
     "test": "vitest run",
     "test:watch": "vitest",
     "typecheck": "pnpm -r --if-present typecheck"
