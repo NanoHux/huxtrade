@@ -12,7 +12,20 @@ const rangeOptionLabel:Record<CoinGlassHeatmapRange,string>={
   "12h":"12 hour","24h":"24 hour","3d":"3 day","7d":"1 week","30d":"1 month"
 };
 
-type DecodedHeatmap={liq:unknown[];y:number[]};
+type DecodedHeatmap={liq:unknown[];y:number[];prices?:Array<[number,...unknown[]]>};
+
+/** Rough span each range should cover, in days, with generous tolerance. */
+const rangeSpanDays:Record<CoinGlassHeatmapRange,number>={"12h":0.5,"24h":1,"3d":3,"7d":7,"30d":31};
+
+function assertRangeMatches(range:CoinGlassHeatmapRange,data:DecodedHeatmap){
+  const points=data.prices;
+  if(!Array.isArray(points)||points.length<2)return;   // nothing to check against
+  const span=(Number(points[points.length-1]![0])-Number(points[0]![0]))/86_400;
+  if(!Number.isFinite(span)||span<=0)return;
+  const expected=rangeSpanDays[range];
+  if(span<expected*0.5||span>expected*2)
+    throw new Error(`CoinGlass returned a ${span.toFixed(2)}-day window for the ${range} range`);
+}
 type CaptureFlag={__cgCapture?:DecodedHeatmap};
 
 // page.evaluate() has no built-in timeout (unlike goto/click/waitForFunction)
@@ -134,12 +147,21 @@ export class CoinGlassBrowserClient{
       // query param, so a non-default range must be picked from the UI.
       const trigger=this.page.getByRole("combobox").filter({hasText:/^(12 hour|24 hour|48 hour|3 day|1 week|2 week|1 month|3 month|6 month|1 Year|2 Year)$/});
       await trigger.first().click({timeout:15_000});
-      await withTimeout(this.page.evaluate(()=>{(window as unknown as CaptureFlag).__cgCapture=undefined;}),captureReadTimeoutMs,"CoinGlass capture-flag reset");
       await this.page.getByRole("option",{name:rangeOptionLabel[range],exact:true}).click({timeout:15_000});
+      // Reset AFTER the option is chosen, never before. The page's own 24h
+      // request is still in flight while the dropdown is open; clearing the
+      // flag first let that response land in it, and waitForFunction returned
+      // immediately with 24h data. Every non-default range silently captured
+      // 24h — the strategy's heatmap_range setting has never taken effect.
+      await withTimeout(this.page.evaluate(()=>{(window as unknown as CaptureFlag).__cgCapture=undefined;}),captureReadTimeoutMs,"CoinGlass capture-flag reset");
     }
     const capturedAtMs=Date.now();
     await this.page.waitForFunction(()=>(window as unknown as CaptureFlag).__cgCapture!==undefined,null,{timeout:30_000});
     const data=await withTimeout(this.page.evaluate(()=>(window as unknown as CaptureFlag).__cgCapture),captureReadTimeoutMs,"CoinGlass capture-data read") as DecodedHeatmap;
+    // The response has to prove it is the range that was asked for. Without
+    // this the failure above was invisible: 24h data is perfectly well-formed,
+    // so nothing downstream could tell it had been served the wrong window.
+    assertRangeMatches(range,data);
     const payload:CoinGlassWebHeatmapPayload={code:"0",data:data as NonNullable<CoinGlassWebHeatmapPayload["data"]>};
     const normalized=normalizeCoinGlassWebHeatmap(payload);
     return {...normalized,sourceUrl:buildCoinGlassHeatmapPageUrl(parsed.url,range),capturedAt:new Date(capturedAtMs)};

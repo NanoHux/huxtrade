@@ -1,5 +1,5 @@
 import { afterEach,describe,expect,it,vi } from "vitest";
-import { BinanceFuturesClient,buildCoinGlassHeatmapPageUrl,intervalMs,normalizeCoinGlassWebHeatmap,parseCoinGlassHeatmapUrl,variationalUnderlying } from "./index.js";
+import { BinanceFuturesClient,buildCoinGlassHeatmapPageUrl,coinGlassHeatmapByTime,intervalMs,normalizeCoinGlassWebHeatmap,parseCoinGlassHeatmapUrl,variationalUnderlying } from "./index.js";
 
 const trade=(id:number,time:number)=>({a:id,p:"100",q:"1",T:time,m:false});
 
@@ -123,5 +123,35 @@ describe("request weight, not just request count",()=>{
     expect(intervalMs("4h")).toBe(14_400_000);
     expect(intervalMs("1d")).toBe(86_400_000);
     expect(()=>intervalMs("1y")).toThrow(/Unsupported/);
+  });
+});
+
+describe("keeping the heatmap's time axis",()=>{
+  // liq cells are [timeIndex, priceIndex, amount]. The live path sums across
+  // every column, which turns "the strongest cluster" into "the level with the
+  // most volume accumulated over the window" — a position sitting there all
+  // day is counted once per column.
+  const payload={code:"0",data:{
+    y:[100,101,102],
+    prices:[[1_700_000_000,"99","101","98","100"],[1_700_000_300,"100","103","99","102"]],
+    liq:[[0,0,50],[0,1,10],[1,1,80],[1,2,5]]
+  }} as never;
+
+  it("returns one map per column, not one map for the window",()=>{
+    const slices=coinGlassHeatmapByTime(payload);
+    expect(slices).toHaveLength(2);
+    expect(slices[0]!.at.getTime()).toBe(1_700_000_000_000);
+    expect(slices[0]!.price).toBe(100);
+    expect(slices[1]!.price).toBe(102);
+  });
+
+  it("keeps each column's own peak, which summing destroys",()=>{
+    const slices=coinGlassHeatmapByTime(payload);
+    const peak=(i:number)=>[...slices[i]!.regions].sort((a,b)=>b.intensity-a.intensity)[0]!;
+    // Column 0 peaks at 100 (50), column 1 peaks at 101 (80).
+    expect(peak(0).price).toBe(100);
+    expect(peak(1).price).toBe(101);
+    // Summed, 101 wins outright (10+80) and column 0's peak disappears.
+    expect(normalizeCoinGlassWebHeatmap(payload).regions.sort((a,b)=>b.intensity-a.intensity)[0]!.price).toBe(101);
   });
 });

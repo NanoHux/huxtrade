@@ -187,6 +187,48 @@ export function buildCoinGlassHeatmapPageUrl(value:string,range:CoinGlassHeatmap
   return url.toString();
 }
 
+/**
+ * One liquidation map per time column, instead of one map for the whole window.
+ *
+ * `liq` cells are [timeIndex, priceIndex, amount] and the live path sums them
+ * across every column — so what the strategy calls "the strongest cluster" is
+ * really "the price level with the most liquidation volume accumulated over
+ * the window", counting a position that sat there all day once per column.
+ * That is a defensible measure but it is not the one the model is written
+ * against, and it cannot be undone after the fact.
+ *
+ * This keeps the axis so a backtest can ask what the map looked like at a
+ * given moment. Deliberately additive: the live path is untouched, because
+ * changing what the strategy aims at is a separate decision from being able
+ * to measure it.
+ */
+export function coinGlassHeatmapByTime(payload:CoinGlassWebHeatmapPayload){
+  const axis=payload.data?.y,cells=payload.data?.liq;
+  const points=(payload.data as {prices?:Array<[number,...unknown[]]>}|undefined)?.prices;
+  if(!Array.isArray(axis)||!Array.isArray(cells)||!Array.isArray(points))throw new Error("CoinGlass Heatmap response has an invalid data shape");
+  const byTime=new Map<number,Map<number,number>>();
+  for(const cell of cells){
+    if(!Array.isArray(cell)||cell.length<3)continue;
+    const tIndex=Number(cell[0]),yIndex=Number(cell[1]),intensity=Number(cell[2]);
+    const price=axis[yIndex];
+    if(!Number.isInteger(tIndex)||!Number.isInteger(yIndex)||price===undefined||!Number.isFinite(intensity)||intensity<=0)continue;
+    const slice=byTime.get(tIndex)??new Map<number,number>();
+    slice.set(price,(slice.get(price)??0)+intensity);
+    byTime.set(tIndex,slice);
+  }
+  const sortedAxis=[...new Set(axis)].sort((a,b)=>a-b);
+  const gaps=sortedAxis.slice(1).map((price,index)=>price-sortedAxis[index]!).filter((gap)=>gap>0).sort((a,b)=>a-b);
+  const step=gaps.length?gaps[Math.floor(gaps.length/2)]!:0;
+  return [...byTime.entries()]
+    .filter(([tIndex])=>points[tIndex]!==undefined)
+    .map(([tIndex,slice])=>({
+      at:new Date(Number(points[tIndex]![0])*1000),
+      price:Number(points[tIndex]![4]??points[tIndex]![1]),
+      regions:eligibleHeatmapRegions([...slice].map(([price,intensity])=>({price,lowPrice:price-step/2,highPrice:price+step/2,intensity})))
+    }))
+    .sort((a,b)=>a.at.getTime()-b.at.getTime());
+}
+
 export function normalizeCoinGlassWebHeatmap(payload:CoinGlassWebHeatmapPayload){
   if(String(payload.code)!=="0")throw new Error(`CoinGlass Heatmap request was rejected (${payload.code}${payload.msg?`: ${payload.msg}`:""})`);
   const axis=payload.data?.y;
