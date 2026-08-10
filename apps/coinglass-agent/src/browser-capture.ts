@@ -125,6 +125,11 @@ export class CoinGlassBrowserClient{
       // timed out under load is exactly the case a reload fixes; neither is
       // worth distinguishing when the response to both is the same.
       const crashed=this.pageCrashed||looksLikeCrash(error);
+      // Only worth replacing a page that exists. Recreating unconditionally
+      // meant a failure that happened BEFORE the context was built threw
+      // "context is unavailable" from the recovery path and buried the real
+      // error — which is the one an operator needs to see.
+      if(!this.context)throw error;
       await this.recreatePage();
       try{
         return await this.captureOnce(sourceUrl,range);
@@ -156,7 +161,19 @@ export class CoinGlassBrowserClient{
       await withTimeout(this.page.evaluate(()=>{(window as unknown as CaptureFlag).__cgCapture=undefined;}),captureReadTimeoutMs,"CoinGlass capture-flag reset");
     }
     const capturedAtMs=Date.now();
-    await this.page.waitForFunction(()=>(window as unknown as CaptureFlag).__cgCapture!==undefined,null,{timeout:30_000});
+    // Wait for a payload of the RIGHT SHAPE, not merely the next one. The page
+    // keeps its own 24h request in flight while the range is being switched,
+    // so "first response after the reset" is a race the 24h data often wins —
+    // and it is well-formed, so nothing downstream could tell.
+    const expected=rangeSpanDays[range];
+    await this.page.waitForFunction((bounds)=>{
+      const captured=(window as unknown as CaptureFlag).__cgCapture;
+      const points=(captured as {prices?:Array<[number,...unknown[]]>}|undefined)?.prices;
+      if(!captured)return false;
+      if(!Array.isArray(points)||points.length<2)return true;
+      const span=(Number(points[points.length-1]![0])-Number(points[0]![0]))/86_400;
+      return span>=bounds.low&&span<=bounds.high;
+    },{low:expected*0.5,high:expected*2},{timeout:45_000});
     const data=await withTimeout(this.page.evaluate(()=>(window as unknown as CaptureFlag).__cgCapture),captureReadTimeoutMs,"CoinGlass capture-data read") as DecodedHeatmap;
     // The response has to prove it is the range that was asked for. Without
     // this the failure above was invisible: 24h data is perfectly well-formed,
