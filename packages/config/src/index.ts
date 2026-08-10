@@ -284,6 +284,24 @@ export const fixedRules = Object.freeze({
     // step a decision instead. Cancelling a virtual entry costs nothing, which
     // is what makes the extra question worth asking. Set false to go back to
     // posting the limit order immediately.
+    // Target as a fixed multiple of the stop distance, instead of aiming at
+    // the strongest liquidation cluster. 0 restores the heatmap objective.
+    //
+    // Measured over 31 days and 46 assets, rebuilt from heatmaps that keep
+    // their time axis: aiming at the peak lost money at every stop width
+    // tried (-0.37 per trade at the shipped 0.5 ATR stop, -1.00 at 0.25),
+    // while a fixed multiple was positive in every cell of the grid. The
+    // reason sits in a separate measurement — across 28,902 observations,
+    // price reached the strongest cluster slightly LESS often than an
+    // equal-distance level in the opposite direction, so the peak carries no
+    // information about where price is going and picking it as an objective
+    // is worse than picking a distance.
+    //
+    // 2.0 rather than the 2.65 that scored highest: that cell sat on a 1.5
+    // ATR stop whose neighbours swung from +3.47 to -2.11, which is a fitted
+    // artefact, not a rule. At a 0.5 ATR stop the row rises smoothly from
+    // 1.0R to 3.0R and 2.0R pays the same as 3.0R while resolving sooner.
+    takeProfitRiskReward: 2,
     virtualEntryConfirmation: 1,
     // Confirmation runs on the close of 5m candles.
     virtualEntryIntervalMinutes: 5

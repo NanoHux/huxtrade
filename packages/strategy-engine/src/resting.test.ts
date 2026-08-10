@@ -102,13 +102,17 @@ describe("entry level selection",()=>{
 });
 
 describe("resting order plans",()=>{
+  // These assert how the heatmap objective is chosen. It is no longer the
+  // default — a fixed multiple of the stop replaced it — but it stays
+  // reachable, and the peak-selection rules still need covering.
+  const aimAtPeak=resolveRestingEntry({takeProfitRiskReward:0});
   const entryZone=region(96,97,0.9,50),targetZone=region(104.5,105.5,1,100);
   const base={symbol:"BTCUSDT",direction:"LONG" as const,closedAt:"2026-08-07T00:00:00Z",price:100,atr1h:2,marginUsdc:10,leverage:5};
 
   it("prices the stop and target off the resting level, not the market price",()=>{
     const candidate=chooseEntryLevel({direction:"LONG",price:100,atr1h:2,regions:[entryZone,targetZone],swing:96.5})!;
     expect(candidate.level).toBe(97.2);
-    const plan=makeRestingOrderPlan({...base,candidate,regions:[entryZone,targetZone]});
+    const plan=makeRestingOrderPlan({...base,candidate,regions:[entryZone,targetZone]},aimAtPeak);
     // Stop clears the deeper of {zone low 96, swing 96.5} by 0.5 ATR.
     expect(plan.stopLoss).toBeCloseTo(95,9);
     // Target is the far zone less the 0.15 ATR offset — measured from 97.2,
@@ -124,13 +128,13 @@ describe("resting order plans",()=>{
     // margin-fraction fallback any more: a stop invented from position size
     // has no relationship to the chart, so its ratio measures nothing.
     const candidate:EntryCandidate={level:98,score:0.3,sources:["EMA"],ema:98};
-    expect(()=>makeRestingOrderPlan({...base,candidate,regions:[targetZone]})).toThrow(/no price structure/);
+    expect(()=>makeRestingOrderPlan({...base,candidate,regions:[targetZone]},aimAtPeak)).toThrow(/no price structure/);
   });
 
   it("keys on the level so a replacement at a moved level is a distinct order",()=>{
     // swing 2 below the level, so the stop is wide enough that the 105 zone
     // pays 2.5x rather than 6.25x and clears the ratio ceiling.
-    const plan=(level:number)=>makeRestingOrderPlan({...base,candidate:{level,score:1,sources:["SWING"],swing:level-2},regions:[targetZone]}).idempotencyKey;
+    const plan=(level:number)=>makeRestingOrderPlan({...base,candidate:{level,score:1,sources:["SWING"],swing:level-2},regions:[targetZone]},aimAtPeak).idempotencyKey;
     expect(plan(97.2)).toBe(plan(97.2));
     expect(plan(97.2)).not.toBe(plan(97.9));
   });
@@ -139,7 +143,7 @@ describe("resting order plans",()=>{
     // SHORT from 102.8, stop 104 (swing 103 + 0.5 ATR), risk 1.2. The 102.4
     // band carries the full intensity of the only zone ahead, so it IS the
     // objective — and at 102.1 after the offset it pays well under 1.4x.
-    expect(()=>makeRestingOrderPlan({...base,direction:"SHORT",candidate:{level:102.8,score:1,sources:["SWING"],swing:103},regions:[region(102.3,102.5,1)]}))
+    expect(()=>makeRestingOrderPlan({...base,direction:"SHORT",candidate:{level:102.8,score:1,sources:["SWING"],swing:103},regions:[region(102.3,102.5,1)]},aimAtPeak))
       .toThrow(/only pays/);
   });
 
@@ -148,15 +152,15 @@ describe("resting order plans",()=>{
     const candidate:EntryCandidate={level:98.5,score:1,sources:["SWING"],swing:98.5};
     // SHORT from 98.5, stop 99.5, risk 1. The weak band is run through, so the
     // objective is the 95 cluster; the strong one becomes the objective itself.
-    expect(makeRestingOrderPlan({...base,direction:"SHORT",candidate,regions:[weak,objective]}).heatmapTarget?.price).toBe(95);
-    expect(makeRestingOrderPlan({...base,direction:"SHORT",candidate,regions:[strong,objective]}).heatmapTarget?.price).toBe(96.75);
+    expect(makeRestingOrderPlan({...base,direction:"SHORT",candidate,regions:[weak,objective]},aimAtPeak).heatmapTarget?.price).toBe(95);
+    expect(makeRestingOrderPlan({...base,direction:"SHORT",candidate,regions:[strong,objective]},aimAtPeak).heatmapTarget?.price).toBe(96.75);
   });
 
   it("mirrors the SHORT stop off the zone's high edge",()=>{
     const zone=region(103,104,0.9,50);
     const candidate=chooseEntryLevel({direction:"SHORT",price:100,atr1h:2,regions:[zone],swing:103.5})!;
     expect(candidate.level).toBe(102.8);
-    const plan=makeRestingOrderPlan({...base,direction:"SHORT",candidate,regions:[zone,region(94.5,95.5,1,100)]});
+    const plan=makeRestingOrderPlan({...base,direction:"SHORT",candidate,regions:[zone,region(94.5,95.5,1,100)]},aimAtPeak);
     // Stop clears the higher of {zone high 104, swing 103.5} by 0.5 ATR.
     expect(plan.stopLoss).toBeCloseTo(105,9);
     expect(plan.takeProfit).toBeCloseTo(95.3,9);
@@ -824,5 +828,49 @@ describe("withdrawing an unfilled order",()=>{
     const decision=revalidateWorkingOrder({bias:flipped,workingOrder:null,newPlan:undefined,closePrice:100,atr1h:2,tradable:true,openPosition:held});
     expect(decision.action).toBe("NONE");
     expect(decision.reason).toContain("left to its own stop and target");
+  });
+});
+
+describe("a target set by distance instead of by cluster",()=>{
+  // Over 31 days and 46 assets, aiming at the strongest liquidation cluster
+  // lost money at every stop width tried, while a fixed multiple of the stop
+  // was positive in every cell of the grid. Across 28,902 observations price
+  // reached the peak slightly LESS often than an equal-distance level in the
+  // opposite direction — the cluster says nothing about direction, so an
+  // objective built on it is worse than one built on a distance.
+  const zone=region(96,97,0.9,50),far=region(104.5,105.5,1,100);
+  const base={symbol:"BTCUSDT",direction:"LONG" as const,closedAt:"2026-08-07T00:00:00Z",price:100,atr1h:2,marginUsdc:10,leverage:5};
+  const candidate:EntryCandidate={level:97.2,score:1,sources:["HEATMAP"],region:zone};
+
+  it("puts the target a fixed multiple of the stop away",()=>{
+    const plan=makeRestingOrderPlan({...base,candidate,regions:[zone,far]});
+    const risk=plan.entryPrice-plan.stopLoss;
+    expect(plan.takeProfit).toBeCloseTo(plan.entryPrice+restingEntryDefaults.takeProfitRiskReward*risk,9);
+    expect(plan.expectedRiskReward).toBe(restingEntryDefaults.takeProfitRiskReward);
+  });
+
+  it("still records the cluster it would have aimed at",()=>{
+    // The comparison that produced this rule has to stay measurable, so the
+    // peak keeps travelling on the plan even though it no longer sets price.
+    expect(makeRestingOrderPlan({...base,candidate,regions:[zone,far]}).heatmapTarget?.price).toBe(105);
+  });
+
+  it("no longer needs a cluster ahead at all",()=>{
+    const plan=makeRestingOrderPlan({...base,candidate,regions:[zone]});
+    expect(plan.expectedRiskReward).toBe(restingEntryDefaults.takeProfitRiskReward);
+    expect(plan.heatmapTarget).toBeUndefined();
+  });
+
+  it("mirrors for a SHORT",()=>{
+    const short={...base,direction:"SHORT" as const};
+    const above:EntryCandidate={level:102.8,score:1,sources:["SWING"],swing:103};
+    const plan=makeRestingOrderPlan({...short,candidate:above,regions:[]});
+    const risk=plan.stopLoss-plan.entryPrice;
+    expect(plan.takeProfit).toBeCloseTo(plan.entryPrice-restingEntryDefaults.takeProfitRiskReward*risk,9);
+  });
+
+  it("returns to the cluster objective when the multiple is zero",()=>{
+    const plan=makeRestingOrderPlan({...base,candidate,regions:[zone,far]},resolveRestingEntry({takeProfitRiskReward:0}));
+    expect(plan.takeProfit).toBeCloseTo(104.7,9);
   });
 });

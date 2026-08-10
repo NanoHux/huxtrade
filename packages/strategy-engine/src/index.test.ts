@@ -1,10 +1,14 @@
 import { describe, expect, it } from "vitest";
 import { fixedRules } from "@huxtrade/config";
-import { adjustMarginForPlatformMinimum, assertOrderTransition, candidateDirections, chooseHeatmapTarget, directionAllowed, eligibleHeatmapRegions, heatmapEntryState, makeOrderPlan, marginPauseTransition, riskGate } from "./index.js";
+import { resolveRestingEntry, adjustMarginForPlatformMinimum, assertOrderTransition, candidateDirections, chooseHeatmapTarget, directionAllowed, eligibleHeatmapRegions, heatmapEntryState, makeOrderPlan, marginPauseTransition, riskGate } from "./index.js";
 
 const region=(price:number,intensity:number)=>({price,lowPrice:price-1,highPrice:price+1,intensity,rank:1,percentile:1});
 
 describe("strategy and risk rules", () => {
+  // The heatmap objective is no longer the default — a fixed multiple of the
+  // stop replaced it — but it stays reachable, and these assert how the peak
+  // is chosen when it is in use.
+  const aimAtPeak = resolveRestingEntry({ takeProfitRiskReward: 0 });
   it("enforces BTC direction permission", () => {
     expect(directionAllowed("BULL", "LONG")).toBe(true);
     expect(directionAllowed("BULL", "SHORT")).toBe(false);
@@ -20,7 +24,7 @@ describe("strategy and risk rules", () => {
     // The swing sits 20 below the entry so the stop is wide enough that the
     // objective is reached on its own merits; with a nearer swing the same
     // target would pay 6.3x and be brought back in to the cap instead.
-    const plan = makeOrderPlan({ symbol: "BTCUSDT", direction: "LONG", closedAt: "2026-08-04T00:00:00Z", entryPrice: 100, swing: 80, atr1h: 2, regions, marginUsdc: 10, leverage: 5 });
+    const plan = makeOrderPlan({ symbol: "BTCUSDT", direction: "LONG", closedAt: "2026-08-04T00:00:00Z", entryPrice: 100, swing: 80, atr1h: 2, regions, marginUsdc: 10, leverage: 5 }, aimAtPeak);
     expect(plan.expectedRiskReward).toBeGreaterThanOrEqual(fixedRules.minimumRiskReward);
     expect(plan.expectedRiskReward).toBeLessThanOrEqual(fixedRules.maximumRiskReward);
     expect(plan.notionalUsdc).toBe(50);
@@ -32,7 +36,7 @@ describe("strategy and risk rules", () => {
     // the peak is not where this trade can collect — the trade is still worth
     // taking with the objective brought in to exactly the cap.
     const regions = eligibleHeatmapRegions(Array.from({ length: 10 }, (_, i) => ({ price: 110 + i * 10, lowPrice:109+i*10, highPrice:111+i*10, intensity: i + 1 })));
-    const plan = makeOrderPlan({ symbol: "BTCUSDT", direction: "LONG", closedAt: "2026-08-04T00:00:00Z", entryPrice: 100, swing: 90, atr1h: 2, regions, marginUsdc: 10, leverage: 5 });
+    const plan = makeOrderPlan({ symbol: "BTCUSDT", direction: "LONG", closedAt: "2026-08-04T00:00:00Z", entryPrice: 100, swing: 90, atr1h: 2, regions, marginUsdc: 10, leverage: 5 }, aimAtPeak);
     expect(plan.expectedRiskReward).toBeCloseTo(fixedRules.maximumRiskReward, 9);
     // Risk is 11 (entry 100, stop 90 - 0.5 x 2), so the cap sits at 100 + 4x11.
     expect(plan.takeProfit).toBeCloseTo(144, 9);
@@ -54,7 +58,7 @@ describe("strategy and risk rules", () => {
     // Risk 11 (entry 100, swing 90, atr 2). The peak at 130 is the objective;
     // the band at 110 carries only a fifth of its intensity, so the move is
     // assumed to consume it rather than end there.
-    const plan=makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:2,regions:[region(110,20),region(130,100)],marginUsdc:10,leverage:5});
+    const plan=makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:2,regions:[region(110,20),region(130,100)],marginUsdc:10,leverage:5}, aimAtPeak);
     expect(plan.heatmapTarget?.price).toBe(130);
     // 0.15 ATR in front of the zone.
     expect(plan.takeProfit).toBeCloseTo(130 - fixedRules.takeProfitAtrOffset * 2, 9);
@@ -63,7 +67,7 @@ describe("strategy and risk rules", () => {
     // Same shape, but the intervening band now carries 70% of the peak — over
     // the 60% bar — so it becomes the objective and the ratio is measured
     // against it instead.
-    const plan=makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:2,regions:[region(120,70),region(130,100)],marginUsdc:10,leverage:5});
+    const plan=makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:2,regions:[region(120,70),region(130,100)],marginUsdc:10,leverage:5}, aimAtPeak);
     expect(plan.heatmapTarget?.price).toBe(120);
     const target = 120 - fixedRules.takeProfitAtrOffset * 2;
     expect(plan.takeProfit).toBeCloseTo(target, 9);
@@ -74,7 +78,7 @@ describe("strategy and risk rules", () => {
     // way first and only pays 1.06x the stop distance. The floor still refuses
     // outright: a target too NEAR cannot be fixed by moving it, unlike one
     // that is too far.
-    expect(()=>makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:2,regions:[region(112,70),region(130,100)],marginUsdc:10,leverage:5}))
+    expect(()=>makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:90,atr1h:2,regions:[region(112,70),region(130,100)],marginUsdc:10,leverage:5}, aimAtPeak))
       .toThrow(/only pays 1.06x/);
   });
   it("takes the nearest qualifying obstacle, and never recurses past it",()=>{
@@ -90,13 +94,13 @@ describe("strategy and risk rules", () => {
     expect(chooseHeatmapTarget([region(112,bar-1),region(130,100)],"LONG",100)?.price).toBe(130);
   });
   it("refuses the trade when the structure cannot place a stop",()=>{
-    expect(()=>makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:105,atr1h:2,regions:[region(200,10)],marginUsdc:10,leverage:5}))
+    expect(()=>makeOrderPlan({symbol:"BTCUSDT",direction:"LONG",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:105,atr1h:2,regions:[region(200,10)],marginUsdc:10,leverage:5}, aimAtPeak))
       .toThrow(/wrong side of the entry/);
   });
   it("aims at the ratio cap when there is no zone ahead at all",()=>{
     // Nothing overhead is what a runaway move looks like, not a reason to
     // refuse: the structural stop is already placed, so the trade runs to 4R.
-    const plan=makeOrderPlan({symbol:"BTCUSDT",direction:"SHORT",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:105,atr1h:2,regions:[],marginUsdc:10,leverage:5});
+    const plan=makeOrderPlan({symbol:"BTCUSDT",direction:"SHORT",closedAt:"2026-08-04T00:00:00Z",entryPrice:100,swing:105,atr1h:2,regions:[],marginUsdc:10,leverage:5}, aimAtPeak);
     expect(plan.heatmapTarget).toBeUndefined();
     expect(plan.expectedRiskReward).toBeCloseTo(fixedRules.maximumRiskReward,9);
     // Risk is 6 (stop 105 + 0.5 x 2), so a SHORT's cap is 100 - 4x6.

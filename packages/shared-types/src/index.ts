@@ -88,6 +88,8 @@ export interface RestingEntrySettings {
   structuralRejectionLimit: number;
   /** How long a rested asset stays out, in hours. */
   structuralBackoffHours: number;
+  /** Target as this multiple of the stop distance. 0 aims at the strongest liquidation cluster instead. */
+  takeProfitRiskReward: number;
   /** 1 to hold entries locally until price arrives and two 5m closes confirm; 0 to post the limit order immediately. */
   virtualEntryConfirmation: number;
   /** Candle length the confirmation runs on, in minutes. */

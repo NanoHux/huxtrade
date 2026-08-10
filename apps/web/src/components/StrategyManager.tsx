@@ -9,7 +9,7 @@ const all:ConditionType[]=["OI","CVD","FUNDING","HEATMAP"];
 const restingDefaults:RestingEntrySettings={
   entryBandAtrMin:0.3,entryBandAtrMax:2.5,entryOffsetAtr:0.1,confluenceMergeAtr:0.35,
   replaceThresholdAtr:0.25,biasPersistenceScans:4,flipConfirmationScans:2,maxArmedAssets:15,swingScore:0.55,emaScore:0.3,incumbentScoreBonus:0.5,extremeMoveBlockPercent:15,lossStreakCount:3,lossStreakWindowHours:6,lossStreakHaltHours:12,
-  scaleOutTriggerR:0.5,scaleOutFraction:0.5,scaleOutMinStopPercent:0.8,breakevenOffsetR:0.05,minStopSpreadMultiple:4,structuralRejectionLimit:3,structuralBackoffHours:6,virtualEntryConfirmation:1,virtualEntryIntervalMinutes:5
+  scaleOutTriggerR:0.5,scaleOutFraction:0.5,scaleOutMinStopPercent:0.8,breakevenOffsetR:0.05,minStopSpreadMultiple:4,structuralRejectionLimit:3,structuralBackoffHours:6,takeProfitRiskReward:2,virtualEntryConfirmation:1,virtualEntryIntervalMinutes:5
 };
 const restingFields:Array<{key:keyof RestingEntrySettings;label:string;hint:string;step:number;min:number;max:number}>=[
   {key:"maxArmedAssets",label:"同时武装币数上限",hint:"超出按信号强度取前 N，只统计可交易的币",step:1,min:1,max:120},

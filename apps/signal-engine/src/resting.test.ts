@@ -165,11 +165,11 @@ describe("re-pricing a working order",()=>{
     expect(recomputeWorkingRiskReward({...base,swing:null,regions:[targetZone]})).toBeUndefined();
   });
 
-  it("prices a level with no zone ahead at the ratio cap, not as unknown",()=>{
-    // Nothing ahead used to make the plan un-buildable. It now reads as a
-    // runaway move and aims at the cap, so the working order keeps a real
-    // ratio instead of dropping out of the hysteresis comparison.
-    expect(recomputeWorkingRiskReward({...base,swing:0.0748,regions:[]})).toBeCloseTo(fixedRules.maximumRiskReward,9);
+  it("prices a level with no zone ahead, rather than reporting it as unknown",()=>{
+    // Nothing ahead used to make the plan un-buildable, which read downstream
+    // as "below the floor" and replaced the order every scan. The target is a
+    // fixed multiple of the stop now, so an empty heatmap prices normally.
+    expect(recomputeWorkingRiskReward({...base,swing:0.0748,regions:[]})).toBeCloseTo(settings.takeProfitRiskReward,9);
   });
 
   it("returns the real ratio when the level can still be priced",()=>{

@@ -117,14 +117,14 @@ export function chooseHeatmapTarget(regions: HeatmapRegion[], direction: Directi
 export function makeOrderPlan(input: {
   symbol: string; venueSymbol?: string; direction: Direction; closedAt: string; entryPrice: number; swing: number; atr1h: number;
   regions: HeatmapRegion[]; marginUsdc: number; leverage: number;
-}): OrderPlan {
+}, rules: RestingEntrySettings = restingEntryDefaults): OrderPlan {
   return {
     venueSymbol: input.venueSymbol,
     ...composePlan({
       ...input,
       idempotencyKey: createHash("sha256").update(`${input.symbol}|${input.direction}|${input.closedAt}`).digest("hex"),
       structuralAnchor: input.swing
-    }),
+    }, rules),
     entryKind: "MARKET_ON_SIGNAL"
   };
 }
@@ -155,6 +155,15 @@ function composePlan(input: {
   const risk = direction === "LONG" ? entryPrice - stopLoss : stopLoss - entryPrice;
   if (!(risk > 0)) throw new Error("the structural stop sits on the wrong side of the entry");
   const target = chooseHeatmapTarget(input.regions, direction, entryPrice);
+  // A fixed distance, when configured. The peak is still resolved and still
+  // travels on the plan, so the ledger keeps recording what it would have
+  // aimed at — the comparison that produced this rule has to stay measurable.
+  if (settings.takeProfitRiskReward > 0) {
+    const takeProfit = direction === "LONG" ? entryPrice + settings.takeProfitRiskReward * risk : entryPrice - settings.takeProfitRiskReward * risk;
+    return { idempotencyKey: input.idempotencyKey, symbol: input.symbol, direction, entryPrice, stopLoss, takeProfit,
+      expectedRiskReward: settings.takeProfitRiskReward, marginUsdc: input.marginUsdc, leverage: input.leverage,
+      notionalUsdc: input.marginUsdc * input.leverage, heatmapTarget: target };
+  }
   // The furthest the target may ever sit. Beyond this the ratio stops
   // measuring the quality of the setup and starts measuring how far away the
   // peak happens to be, and the trade resolves to a stop every time.
@@ -202,7 +211,7 @@ export function resolveRestingEntry(overrides?:Partial<RestingEntrySettings>|nul
   // positive-only merge above would have silently ignored it.
   // 0 is meaningful for each of these — it switches the rule off — so the
   // positive-only merge above would silently restore the default instead.
-  for(const key of ["extremeMoveBlockPercent","lossStreakCount","structuralRejectionLimit","virtualEntryConfirmation"] as const){
+  for(const key of ["extremeMoveBlockPercent","lossStreakCount","structuralRejectionLimit","virtualEntryConfirmation","takeProfitRiskReward"] as const){
     const value=overrides?.[key];
     if(typeof value==="number"&&Number.isFinite(value)&&value>=0)resolved[key]=value;
   }
