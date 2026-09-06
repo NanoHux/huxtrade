@@ -90,6 +90,8 @@ export interface RestingEntrySettings {
   structuralBackoffHours: number;
   /** Target as this multiple of the stop distance. 0 aims at the strongest liquidation cluster instead. */
   takeProfitRiskReward: number;
+  /** Hard ceiling on one trade's loss, as a percentage of its margin. Divided by leverage it becomes the widest the stop may sit from entry. 0 disables the cap. */
+  maxStopLossPercent: number;
   /** 1 to hold entries locally until price arrives and two 5m closes confirm; 0 to post the limit order immediately. */
   virtualEntryConfirmation: number;
   /** Candle length the confirmation runs on, in minutes. */
@@ -181,6 +183,12 @@ export interface OrderPlan {
   heatmapTarget?: HeatmapRegion;
   entryKind?: EntryKind;
   entryProvenance?: RestingEntryProvenance;
+  /**
+   * The position is closed by a clock, not by its target. Suppresses the
+   * minimum risk/reward floor, which measures whether a target pays for its
+   * stop — a question that has no meaning when the target is never the exit.
+   */
+  timeExit?: boolean;
 }
 
 /** Active order states hold a symbol/side slot per spec 6.3. */
@@ -227,28 +235,116 @@ export interface ServiceHealth {
   blocksTrading: boolean;
 }
 
+/** One leg of the gainers basket as it stands on the venue right now. */
+export interface GainersPosition {
+  symbol: string;
+  quantity: number;
+  entryPrice: number;
+  markPrice: number | null;
+  unrealizedPnl: number | null;
+  /** Planned exits, carried from the leg notification the agent emitted at open. */
+  takeProfit: number | null;
+  stopLoss: number | null;
+  marginUsdc: number | null;
+  openedAt: string | null;
+}
+
+/** A basket the agent has already closed, summed from its per-leg exits. */
+export interface GainersBasketResult {
+  closedAt: string;
+  mode: string;
+  legs: number;
+  realizedPnl: number;
+}
+
+/**
+ * One calendar day's realised P&L, keyed by the Asia/Shanghai date the basket
+ * was *closed* on — a basket opened 23:55 settles the next morning, and the
+ * money lands on that morning's date.
+ */
+export interface DailyPnl {
+  /** YYYY-MM-DD, Asia/Shanghai. */
+  date: string;
+  /** Scheduled baskets, net of fees. null when the close predates per-leg P&L being recorded. */
+  realizedPnl: number | null;
+  /** What the price did, before costs. null for records written before the split was captured. */
+  grossPnl: number | null;
+  /** Perpetual funding over the hold; positive means the position was paid. */
+  funding: number | null;
+  /** What the round trip cost, as a positive number. null likewise. */
+  commission: number | null;
+  legs: number;
+  baskets: number;
+  /** Manual test baskets, kept apart so they never move the headline number. */
+  testPnl: number | null;
+  testLegs: number;
+}
+
 export interface DashboardSnapshot {
   generatedAt: string;
   liveTradingEnabled: boolean;
-  globalPaused: boolean;
-  btcRegime: BtcRegime;
-  btcContext?: {
-    dailyDirection: "BULL" | "BEAR" | "MIXED";
-    fourHourConfirmation: "BULL" | "BEAR" | "MIXED";
-    adxState: "TREND" | "RANGE" | "TRANSITION";
-    adx: number | null;
-  };
   marginUsagePercent: number;
   balanceUsdc: number;
-  variationalLoggedIn: boolean;
-  variationalReconciled?: boolean;
-  assets: Asset[];
   services: ServiceHealth[];
-  orders: Array<Record<string, unknown>>;
-  openOrders: DashboardOrder[];
-  openPositions: DashboardPosition[];
-  stats: { signals: number; orders: number; fills: number; fillRate: number; winRate: number; realizedPnl: number };
+  /**
+   * The daily gainers basket — the only strategy that trades. Positions come
+   * from the agent's own venue snapshot rather than the orders table, which
+   * the basket never writes to.
+   */
+  gainers: {
+    enabled: boolean;
+    marginUsdc: number | null;
+    /** Present only while a basket is live, which separates "armed" from "holding". */
+    closeAt: string | null;
+    openLegs: number;
+    positions: GainersPosition[];
+    positionsAt: string | null;
+    history: GainersBasketResult[];
+    stats: { baskets: number; winners: number; realizedPnl: number };
+  };
 }
 
 export const isTerminalOrderState = (state: OrderState) =>
   ["CLOSED_TP", "CLOSED_SL", "LIQUIDATED", "CLOSED_REVERSED", "SUBMISSION_FAILED", "CANCELLED_EXTERNALLY", "CANCELLED_REPLACED"].includes(state);
+
+/**
+ * The gainers basket's parameters, in one place because three of them are also
+ * prose on the settings page. When they lived only in the agent, the page went
+ * on advertising a 15% take-profit and a Monday skip for as long as nobody
+ * re-read it; anything user-visible now derives from these.
+ */
+export const gainersStrategy = {
+  leverage: 2,
+  /** Legs per basket — the top N of the gainers ranking. */
+  basket: 4,
+  /** Price move that closes a leg in profit, before leverage. */
+  takeProfitFraction: 0.30,
+  /**
+   * Price move that closes a leg in loss, before leverage. At 2x this is an 80%
+   * margin loss, and it sits inside the ~49% liquidation move so the stop can
+   * actually fire — the old 0.80 sat past liquidation and never triggered.
+   */
+  stopFraction: 0.40,
+  /** 1.00 = long only; the short leg is retired. */
+  longWeight: 1.00,
+  /** Share of the balance posted as margin; the rest is headroom for later legs. */
+  deployFraction: 0.95,
+  /** Ranking window: change over the last N hours. */
+  lookbackHours: 52,
+  /**
+   * On the hour, deliberately: UTC 16:00 in, 00:00 out — UTC+8 00:00 and 08:00.
+   *
+   * The entry used to sit at 15:55 to dodge the crowd that trades the round
+   * hour, and that cost is now accepted on purpose. The backtest can only fill
+   * on the hourly grid, so a five-minute offset made every measurement an
+   * approximation of what the agent actually did; matching the grid is worth
+   * more than the fill it buys, because it is what lets a backtested change be
+   * trusted in production.
+   *
+   * The ranking anchor moves with it — floor(entry − 52h) is now the 12:00 bar
+   * two days back rather than 11:00 — which reselects about 8% of the legs.
+   */
+  openHourUtc: 16,
+  openMinuteUtc: 0,
+  holdHours: 8
+} as const;

@@ -1,0 +1,74 @@
+/* Realised-P&L calendar. Sign is the hue, magnitude is the fill opacity, so a
+   month reads as a shape before any number is parsed. */
+/* minmax(0,…) rather than 1fr: a bare 1fr floors at the cell's min-content, so
+   on a narrow screen the amount text pushed the seventh column past the panel. */
+.calGrid { display: grid; grid-template-columns: repeat(7, minmax(0, 1fr)); gap: 6px; }
+
+.calHead {
+  text-align: center; padding: 6px 0 2px; font-size: 9px; letter-spacing: 1px;
+  color: var(--muted); text-transform: uppercase;
+}
+
+.calCell {
+  position: relative; min-height: 74px; padding: 8px 9px;
+  border: 1px solid var(--line); background: #0a151a;
+  display: flex; flex-direction: column; gap: 2px;
+}
+.calCell.blank { border-color: transparent; background: transparent; min-height: 0; }
+
+/* --shade is set per cell from the day's size against the month's largest. */
+.calCell.win  { border-color: #1d4c3e; background: color-mix(in srgb, var(--green) calc(var(--shade) * 26%), #0a151a); }
+.calCell.loss { border-color: #5a302f; background: color-mix(in srgb, var(--red)   calc(var(--shade) * 26%), #0a151a); }
+.calCell.flat { border-color: var(--line); }
+
+.calCell.today { outline: 1px solid var(--green); outline-offset: -2px; }
+
+.calDay { font-size: 10px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.calCell.win .calDay, .calCell.loss .calDay { color: #b9c5c2; }
+
+.calPnl {
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 15px; font-weight: 600; line-height: 1.2; margin-top: auto;
+  font-variant-numeric: tabular-nums;
+  overflow: hidden; text-overflow: ellipsis;
+}
+.calCell.win .calPnl  { color: var(--green); }
+.calCell.loss .calPnl { color: var(--red); }
+
+.calMeta { font-size: 9px; color: var(--muted); }
+.calMeta.dashy { margin-top: auto; }
+
+/* Price move on the left, what it cost on the right — the net above is their sum. */
+.calSplit {
+  display: flex; justify-content: space-between; gap: 4px;
+  font-family: "SFMono-Regular", Consolas, monospace;
+  font-size: 9px; font-variant-numeric: tabular-nums;
+}
+.calFee { color: var(--muted); }
+
+.calTest {
+  position: absolute; top: 6px; right: 6px;
+  font-size: 8px; padding: 1px 4px; border: 1px solid #5d4830;
+  background: #251f16; color: #efbc69;
+}
+
+.calLegend {
+  display: flex; align-items: center; gap: 16px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 12px; border-top: 1px solid var(--line);
+  font-size: 10px; color: var(--muted);
+}
+.calLegend span { display: inline-flex; align-items: center; gap: 6px; }
+.calSw { width: 11px; height: 11px; border: 1px solid var(--line); background: #0a151a; display: inline-block; }
+.calSw.win  { border-color: #1d4c3e; background: color-mix(in srgb, var(--green) 26%, #0a151a); }
+.calSw.loss { border-color: #5a302f; background: color-mix(in srgb, var(--red) 26%, #0a151a); }
+
+@media (max-width: 700px) {
+  .calGrid { gap: 3px; }
+  .calCell { min-height: 54px; padding: 4px 3px; }
+  .calPnl { font-size: 10px; letter-spacing: -.3px; }
+  .calDay { font-size: 9px; }
+  .calMeta, .calTest, .calSplit { display: none; }
+  /* The month grid is the point of the page — it must not be the thing that
+     scrolls sideways. Only the summary table below is allowed to. */
+  .panel.calPanel { overflow-x: visible; }
+}

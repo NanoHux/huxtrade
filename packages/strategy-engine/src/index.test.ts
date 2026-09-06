@@ -8,7 +8,9 @@ describe("strategy and risk rules", () => {
   // The heatmap objective is no longer the default — a fixed multiple of the
   // stop replaced it — but it stays reachable, and these assert how the peak
   // is chosen when it is in use.
-  const aimAtPeak = resolveRestingEntry({ takeProfitRiskReward: 0 });
+  // The loss cap is a separate rule with its own tests; leaving it on here
+  // would clamp these fixtures' stops and stop them measuring the structure.
+  const aimAtPeak = resolveRestingEntry({ takeProfitRiskReward: 0, maxStopLossPercent: 0 });
   it("enforces BTC direction permission", () => {
     expect(directionAllowed("BULL", "LONG")).toBe(true);
     expect(directionAllowed("BULL", "SHORT")).toBe(false);

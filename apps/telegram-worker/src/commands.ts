@@ -11,6 +11,7 @@ import { directionLabel } from "./format.js";
  * additionally refuses any chat id other than the configured operator's.
  */
 export const commandList=[
+  ["/openshort","把空单补齐到 5 条（跌幅榜前五，会真实下单）"],
   ["/status","系统与服务状态"],
   ["/acc","账户余额与保证金"],
   ["/pos","当前持仓"],
@@ -70,16 +71,22 @@ export function formatStatus(input:StatusInput){
 
 export interface AccountInput{
   balanceUsdc:number;marginUsagePercent:number;autoPaused:boolean;
-  loggedIn:boolean;reconciled:boolean;
+  /** Venue link. On Binance this is the agent's own health, not a browser session. */
+  connected:boolean;connectionNote?:string;
   openPositions:number;workingOrders:number;
+  /** When the running basket exits, so "0 positions" can be read correctly. */
+  closeAt?:string|null;
 }
 export function formatAccount(input:AccountInput){
+  const held=input.openPositions>0
+    ? `持仓　　${input.openPositions} 个${input.closeAt?`　${new Date(input.closeAt).toLocaleString("zh-CN",{timeZone:"Asia/Shanghai",hour12:false,month:"2-digit",day:"2-digit",hour:"2-digit",minute:"2-digit"})} 平仓`:""}`
+    : "持仓　　无";
   return [
     input.autoPaused?"⚠️ 账户":"💰 账户",
     `余额　　${num(input.balanceUsdc)} USDC`,
     `保证金占用　${num(input.marginUsagePercent,1)}%${input.autoPaused?"　⛔ 已超阈值自动暂停开新仓":""}`,
-    `持仓　　${input.openPositions} 个　挂单 ${input.workingOrders} 张`,
-    `连接　　${input.loggedIn?"已登录":"⚠️ 未登录"}${input.reconciled?"，对账正常":"，⚠️ 对账未完成"}`
+    held,
+    `连接　　${input.connected?"正常":"⚠️ 异常"}${input.connectionNote?`　${input.connectionNote}`:""}`
   ].join("\n");
 }
 

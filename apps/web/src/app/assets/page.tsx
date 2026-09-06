@@ -1,2 +1,0 @@
-import { Header } from "../../components/Header";import { AssetsManager } from "../../components/AssetsManager";import { api } from "../../lib/api";import type { Asset } from "@huxtrade/shared-types";export const dynamic="force-dynamic";export default async function Page(){const assets=await api<Asset[]>("/api/assets",[]);return <><Header eyebrow="Universe" title="币种与数据映射"/><AssetsManager initial={assets}/></>}
-

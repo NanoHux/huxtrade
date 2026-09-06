@@ -3,8 +3,7 @@ import { claimRestartRequest, pool, query, recordHealth, transaction } from "@hu
 import {
   formatAssetResumed,formatClosed,formatEntryFilled,formatGeneric,formatMarginPauseResume,
   formatBreakevenStopFailed,formatDirectionHalted,formatOperatorReply,formatOrderCreated,formatOrderDesynced,formatOrderFailed,formatScaledOut,formatServiceRecovered,formatSessionLost,formatSignal,formatSystemError,
-  type FillRow,type OrderContext
-} from "./format.js";
+  type FillRow,type OrderContext, formatGainersBasket, formatGainersClosed, formatGainersLeg } from "./format.js";
 import {
   formatAccount,formatHelp,formatPlans,formatPnl,formatPositions,formatStatus,formatWorkingOrders,
   parseCommand,type CommandName
@@ -32,6 +31,9 @@ async function format(topic:string,payload:Record<string,unknown>){
     case "closed_tp":
     case "closed_sl_or_liquidated":
     case "closed_reversed":{const order=await orderContext(payload.orderId);return order?formatClosed(String(payload.toState??""),order,await orderFills(payload.orderId)):formatGeneric(topic,payload);}
+    case "gainers_leg":return formatGainersLeg(payload);
+    case "gainers_basket":return formatGainersBasket(payload);
+    case "gainers_closed":return formatGainersClosed(payload);
     case "operator_reply":return formatOperatorReply(payload);
     case "direction_halted":return formatDirectionHalted(payload);
     case "order_desynced":return formatOrderDesynced(payload,await orderContext(payload.orderId));
@@ -92,16 +94,27 @@ async function answer(command:CommandName):Promise<string>{
     });
   }
   if(command==="/acc"){
-    const [state,counts]=await Promise.all([
-      query<{key:string;value:Record<string,unknown>}>("SELECT key,value FROM app_state WHERE key IN ('account_risk','variational_session')"),
-      query<{positions:string;orders:string}>(`SELECT count(*) FILTER (WHERE state='FILLED_OPEN')::text positions,count(*) FILTER (WHERE state='PENDING_ENTRY')::text orders FROM orders`)
+    // Positions come from the agent's venue snapshot, not the orders table: the
+    // gainers basket writes no orders row, so counting that table reported "0
+    // 持仓" while four legs were open. Same reason the dashboard was rebuilt.
+    const [state,health]=await Promise.all([
+      query<{key:string;value:Record<string,unknown>}>("SELECT key,value FROM app_state WHERE key IN ('account_risk','gainers_scheduler')"),
+      query<{state:string;error:string|null}>("SELECT state,error FROM service_health WHERE service='variational-agent'")
     ]);
     const byKey=new Map(state.rows.map((row)=>[row.key,row.value]));
-    const risk=byKey.get("account_risk")??{},session=byKey.get("variational_session")??{};
+    const risk=byKey.get("account_risk")??{},gainers=byKey.get("gainers_scheduler")??{};
+    const positions=Array.isArray(gainers.positions)?gainers.positions.length:0;
+    // The Variational browser session is meaningless on Binance — it is never
+    // written there, so it always read "未登录，对账未完成". The agent's own
+    // health is what actually says whether the venue is reachable.
+    const agent=health.rows[0];
     return formatAccount({
       balanceUsdc:Number(risk.balanceUsdc??0),marginUsagePercent:Number(risk.marginUsagePercent??0),
-      autoPaused:Boolean(risk.autoPaused),loggedIn:Boolean(session.loggedIn),reconciled:Boolean(session.reconciled),
-      openPositions:Number(counts.rows[0]?.positions??0),workingOrders:Number(counts.rows[0]?.orders??0)
+      autoPaused:Boolean(risk.autoPaused),
+      connected:agent?.state==="healthy",
+      connectionNote:agent?.state==="healthy"?undefined:(agent?.error?.slice(0,60)??"agent 未上报"),
+      openPositions:positions,workingOrders:0,
+      closeAt:gainers.closeAt==null?null:String(gainers.closeAt)
     });
   }
   if(command==="/pos"){
@@ -110,11 +123,27 @@ async function answer(command:CommandName):Promise<string>{
         (extract(epoch FROM (now()-coalesce(p.opened_at,o.updated_at)))/60)::text minutes
        FROM orders o JOIN assets a ON a.id=o.asset_id LEFT JOIN positions p ON p.order_id=o.id
        WHERE o.state='FILLED_OPEN' ORDER BY p.opened_at`);
-    return formatPositions(rows.rows.map((row)=>({
+    const tracked=rows.rows.map((row)=>({
       code:row.code,direction:row.direction,entryPrice:Number(row.entry_price),stopLoss:Number(row.stop_loss),
       takeProfit:Number(row.take_profit),unrealizedPnl:row.unrealized_pnl===null?null:Number(row.unrealized_pnl),
       openedMinutes:Number(row.minutes)
-    })));
+    }));
+    // The gainers basket writes no orders row, so those positions are invisible
+    // to the query above. The agent publishes what the venue reports; anything
+    // already covered by an orders row is left to that row, which knows the
+    // stop and target this snapshot does not.
+    const snapshot=(await query<{value:{positions?:Array<Record<string,unknown>>;positionsAt?:string}}>(
+      "SELECT value FROM app_state WHERE key='gainers_scheduler'")).rows[0]?.value;
+    const known=new Set(tracked.map((row)=>row.code));
+    const extra=(snapshot?.positions??[]).filter((row)=>!known.has(String(row.symbol))).map((row)=>({
+      code:String(row.symbol),direction:Number(row.qty)>0?"LONG":"SHORT",
+      entryPrice:row.entryPrice==null?0:Number(row.entryPrice),stopLoss:0,takeProfit:0,
+      unrealizedPnl:row.unrealizedPnl==null?null:Number(row.unrealizedPnl),
+      openedMinutes:row.openedAt?Math.round((Date.now()-new Date(String(row.openedAt)).getTime())/60_000):0
+    }));
+    const stale=snapshot?.positionsAt&&Date.now()-new Date(snapshot.positionsAt).getTime()>5*60_000
+      ?`\n\n⚠ 持仓快照已 ${Math.round((Date.now()-new Date(snapshot.positionsAt).getTime())/60_000)} 分钟未更新，Agent 可能没在跑。`:"";
+    return formatPositions([...tracked,...extra])+stale;
   }
   if(command==="/orders"){
     const rows=await query<{code:string;direction:string;entry_price:string;market_price:string|null;atr:string|null;sources:string[]|null;stop_loss:string;take_profit:string;minutes:string;awaiting_trigger:boolean;trigger_touched_at:string|null}>(
@@ -194,6 +223,20 @@ async function pollCommands(){
       if(!question){await send("用法：/cc 后面直接跟你想问的内容");continue;}
       await query("INSERT INTO operator_messages(chat_id,text) VALUES($1,$2)",[chatId,question]);
       await send("已收到，正在查…");
+      continue;
+    }
+    // The one command that moves money. Everything else on this surface is
+    // read-only on purpose — a Telegram message proves only that it reached
+    // the bot, and the token is enough for anyone holding it to send one — so
+    // this writes a request the agent picks up rather than acting here, and it
+    // refuses to queue a second one while the first is outstanding.
+    if(/^\/openshort(@\S+)?$/i.test(text)){
+      const state=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='gainers_scheduler'")).rows[0]?.value??{};
+      const pending=(state.fillShorts as {state?:string}|undefined)?.state;
+      if(pending&&pending!=="DONE"){await send(`已有一个补单请求在处理中（${pending}），未重复提交。`);continue;}
+      await query("INSERT INTO app_state(key,value) VALUES('gainers_scheduler',$1) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=now()",
+        [JSON.stringify({...state,fillShorts:{state:"REQUESTED",requestedAt:new Date().toISOString()}})]);
+      await send("已收到 /openshort。Agent 将在 30 秒内检查空单数量并补齐到 5 条，逐单结果会发到这里。");
       continue;
     }
     const command=parseCommand(text);

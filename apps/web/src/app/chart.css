@@ -1,2 +1,0 @@
-.chartWrap { position: relative; }
-.chartStatus { position: absolute; inset: 0; display: grid; place-items: center; color: var(--muted); font-size: 11px; pointer-events: none; }

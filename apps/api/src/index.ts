@@ -6,7 +6,6 @@ import { z } from "zod";
 import { fixedRules, getConfig, getEnvFilePath } from "@huxtrade/config";
 import { pool, query, recordBusinessError, recordHealth, transaction } from "@huxtrade/database";
 import { BinanceFuturesClient,parseCoinGlassHeatmapUrl } from "@huxtrade/exchange-clients";
-import { openOrderStates } from "@huxtrade/shared-types";
 import { resolveRestingEntry } from "@huxtrade/strategy-engine";
 
 const config = getConfig();
@@ -190,61 +189,75 @@ app.get("/health", async () => {
   return { status: "ok", service: "api", time: new Date().toISOString() };
 });
 
-const camelDashboardOrder = (r: Record<string, unknown>) => ({
-  id:String(r.id), code:String(r.code), direction:r.direction as "LONG"|"SHORT", state:r.state as never,
-  entryPrice:r.entry_price==null?null:Number(r.entry_price), stopLoss:r.stop_loss==null?null:Number(r.stop_loss),
-  takeProfit:r.take_profit==null?null:Number(r.take_profit), marginUsdc:r.margin_usdc==null?null:Number(r.margin_usdc),
-  realizedPnl:r.realized_pnl==null?null:Number(r.realized_pnl), variationalUrl:String(r.variational_url),
-  updatedAt:r.updated_at==null?null:new Date(String(r.updated_at)).toISOString()
-});
-const camelDashboardPosition = (r: Record<string, unknown>) => ({
-  id:String(r.id), code:String(r.code), direction:r.direction as "LONG"|"SHORT",
-  quantity:r.quantity==null?null:Number(r.quantity), entryPrice:r.entry_price==null?null:Number(r.entry_price),
-  takeProfit:r.take_profit==null?null:Number(r.take_profit), stopLoss:r.stop_loss==null?null:Number(r.stop_loss),
-  unrealizedPnl:r.unrealized_pnl==null?null:Number(r.unrealized_pnl), realizedPnl:r.realized_pnl==null?null:Number(r.realized_pnl),
-  orderState:r.order_state as never, variationalUrl:String(r.variational_url),
-  openedAt:r.opened_at==null?null:new Date(String(r.opened_at)).toISOString(),
-  updatedAt:r.updated_at==null?null:new Date(String(r.updated_at)).toISOString()
-});
-
+/**
+ * The dashboard serves the gainers basket, which is the only strategy that
+ * trades. It deliberately reads no orders/positions row: the basket writes
+ * neither, so those tables only still hold the retired resting-entry model's
+ * records, and rendering them showed a two-week-old book beside an empty
+ * "current positions" table while four leveraged legs were actually open.
+ */
 app.get("/api/dashboard", async () => {
-  const [assets, services, orders, openOrders, openPositions, signalStats, orderStats, global, risk, session, btc] = await Promise.all([
-    query(`SELECT a.*,i.closed_at,i.price,i.oi_change_1h,i.oi_z,i.oi_passed,i.cvd_value,i.cvd_z,i.cvd_passed,i.funding_value,i.funding_z,i.funding_change_z,i.funding_passed,i.heatmap_passed,i.warmup_ready
-      FROM assets a LEFT JOIN LATERAL(SELECT * FROM indicator_snapshots s WHERE s.asset_id=a.id ORDER BY s.closed_at DESC LIMIT 1)i ON true ORDER BY a.code`),
+  const [services, gainers, risk, legs, closes] = await Promise.all([
     query("SELECT * FROM service_health ORDER BY service"),
-    query(`SELECT o.id, a.code, o.direction, o.state, o.entry_price, o.stop_loss, o.take_profit, o.realized_pnl, o.updated_at
-           FROM orders o JOIN assets a ON a.id=o.asset_id ORDER BY o.updated_at DESC LIMIT 20`),
-    query(`SELECT o.id,a.code,o.direction,o.state,o.entry_price,o.stop_loss,o.take_profit,o.margin_usdc,o.realized_pnl,a.variational_url,o.updated_at
-           FROM orders o JOIN assets a ON a.id=o.asset_id WHERE o.state=ANY($1::text[]) ORDER BY o.updated_at DESC LIMIT 50`,[[...openOrderStates]]),
-    query(`SELECT p.id,a.code,p.direction,p.quantity,p.entry_price,p.take_profit,p.stop_loss,p.unrealized_pnl,p.realized_pnl,
-             o.state order_state,a.variational_url,p.opened_at,p.updated_at
-           FROM positions p JOIN assets a ON a.id=p.asset_id JOIN orders o ON o.id=p.order_id
-           WHERE p.closed_at IS NULL ORDER BY p.opened_at DESC LIMIT 50`),
-    query<{ count:string }>("SELECT count(*) FILTER(WHERE accepted)::text count FROM signals"),
-    query<{ orders:string; fills:string; closed:string; wins:string; pnl:string }>(`SELECT count(*)::text orders,
-      count(*) FILTER (WHERE state IN ('FILLED_OPEN','CLOSED_TP','CLOSED_SL','LIQUIDATED'))::text fills,
-      count(*) FILTER (WHERE state IN ('CLOSED_TP','CLOSED_SL'))::text closed,
-      count(*) FILTER (WHERE state='CLOSED_TP')::text wins,
-      -- A scaled-out order realises money twice. realized_pnl is only the
-      -- final exit, so summing it alone hid every banked half.
-      coalesce(sum(coalesce(realized_pnl,0)+coalesce(scaled_out_pnl,0)),0)::text pnl FROM orders`),
-    query<{ value:Record<string,unknown> }>("SELECT value FROM app_state WHERE key='global_pause'"),
+    query<{ value:Record<string,unknown> }>("SELECT value FROM app_state WHERE key='gainers_scheduler'"),
     query<{ value:Record<string,unknown> }>("SELECT value FROM app_state WHERE key='account_risk'"),
-    query<{ value:Record<string,unknown> }>("SELECT value FROM app_state WHERE key='variational_session'"),
-    query<{ btc_regime:string;btc_context:Record<string,unknown> }>("SELECT btc_regime,btc_context FROM scan_runs WHERE btc_regime IS NOT NULL ORDER BY closed_at DESC LIMIT 1")
+    // The venue snapshot carries no exits, so the planned TP/SL come from the
+    // leg notification the agent emitted when it opened that leg.
+    query<{ base:string; payload:Record<string,unknown> }>(`SELECT DISTINCT ON (payload->>'base') payload->>'base' base, payload
+      FROM outbox WHERE topic='notification.gainers_leg' ORDER BY payload->>'base', created_at DESC`),
+    query<{ created_at:string; payload:Record<string,unknown> }>(`SELECT created_at, payload FROM outbox
+      WHERE topic='notification.gainers_closed' AND jsonb_array_length(coalesce(payload->'closed','[]'::jsonb))>0
+      ORDER BY created_at DESC LIMIT 30`)
   ]);
-  const os = orderStats.rows[0] ?? { orders:"0", fills:"0", closed:"0", wins:"0", pnl:"0" };
-  const orderCount=Number(os.orders), fills=Number(os.fills), closed=Number(os.closed), wins=Number(os.wins);
+
+  const state=gainers.rows[0]?.value ?? {};
+  const exits=new Map(legs.rows.map((r) => [r.base, r.payload]));
+  const num=(value:unknown)=>value==null?null:Number(value);
+
+  const positions=(Array.isArray(state.positions)?state.positions:[]).map((raw) => {
+    const p=raw as Record<string,unknown>;
+    const leg=exits.get(String(p.symbol));
+    return {
+      symbol:String(p.symbol), quantity:Number(p.qty),
+      entryPrice:Number(p.entryPrice), markPrice:num(p.markPrice), unrealizedPnl:num(p.unrealizedPnl),
+      takeProfit:num(leg?.takeProfit), stopLoss:num(leg?.stopLoss), marginUsdc:num(leg?.margin),
+      openedAt:p.openedAt==null?null:String(p.openedAt)
+    };
+  });
+
+  const history=closes.rows.map((row) => {
+    const closed=(row.payload.closed ?? []) as Array<Record<string,unknown>>;
+    return {
+      closedAt:new Date(String(row.created_at)).toISOString(),
+      mode:String(row.payload.mode ?? "正式"), legs:closed.length,
+      realizedPnl:closed.reduce((sum,leg) => sum+Number(leg.realizedPnl ?? 0),0)
+    };
+  });
+
   return {
     generatedAt:new Date().toISOString(), liveTradingEnabled,
-    globalPaused:Boolean(global.rows[0]?.value.paused), btcRegime:btc.rows[0]?.btc_regime ?? "TRANSITION", btcContext:btc.rows[0]?.btc_context,
-    marginUsagePercent:Number(risk.rows[0]?.value.marginUsagePercent ?? 0), balanceUsdc:Number(risk.rows[0]?.value.balanceUsdc ?? 0),
-    variationalLoggedIn:Boolean(session.rows[0]?.value.loggedIn), variationalReconciled:Boolean(session.rows[0]?.value.reconciled), assets:assets.rows.map((x) => camelAsset(x as Record<string,unknown>)),
+    marginUsagePercent:Number(risk.rows[0]?.value.marginUsagePercent ?? 0),
+    balanceUsdc:Number(risk.rows[0]?.value.balanceUsdc ?? 0),
     services:services.rows.map((x) => ({ service:x.service, state:x.state, lastSuccessAt:x.last_success_at, consecutiveFailures:x.consecutive_failures, error:x.error, blocksTrading:x.blocks_trading })),
-    orders:orders.rows,
-    openOrders:openOrders.rows.map((x) => camelDashboardOrder(x as Record<string,unknown>)),
-    openPositions:openPositions.rows.map((x) => camelDashboardPosition(x as Record<string,unknown>)),
-    stats:{ signals:Number(signalStats.rows[0]?.count ?? 0), orders:orderCount, fills, fillRate:orderCount?fills/orderCount:0, winRate:closed?wins/closed:0, realizedPnl:Number(os.pnl) }
+    gainers:{
+      enabled:Boolean(state.enabled),
+      marginUsdc:num(state.marginUsdc),
+      closeAt:state.closeAt==null?null:String(state.closeAt),
+      openLegs:Array.isArray(state.open)?(state.open as unknown[]).length:0,
+      positions, positionsAt:state.positionsAt==null?null:String(state.positionsAt),
+      history,
+      // Scheduled baskets only. Test baskets run at a tenth of the size and on
+      // demand, so folding them into the headline P&L measures the operator's
+      // experiments rather than the strategy.
+      stats:(() => {
+        const scheduled=history.filter((b) => b.mode==="正式");
+        return {
+          baskets:scheduled.length,
+          winners:scheduled.filter((b) => b.realizedPnl>0).length,
+          realizedPnl:scheduled.reduce((sum,b) => sum+b.realizedPnl,0)
+        };
+      })()
+    }
   };
 });
 
@@ -497,10 +510,20 @@ app.post("/api/control/assets/:id", async (request) => {
 });
 
 app.get("/api/settings/status", async () => {
-  const session=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='coinglass_session'")).rows[0]?.value;
+  const [sessionRow,gainersRow]=await Promise.all([
+    query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='coinglass_session'"),
+    query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='gainers_scheduler'")
+  ]);
+  const session=sessionRow.rows[0]?.value,gainers=gainersRow.rows[0]?.value??{};
   return {
     coinglassMode:config.COINGLASS_ADAPTER_MODE,coinglassReady:Boolean(session?.ready??session?.loggedIn),coinglassError:session?.error??null,
-    telegramConfigured,variationalMode:config.VARIATIONAL_ADAPTER_MODE,liveTradingEnabled,defaultMarginUsdc,maxMarginUsdc
+    telegramConfigured,variationalMode:config.VARIATIONAL_ADAPTER_MODE,binanceMode:Boolean(config.BINANCE_API_KEY&&config.BINANCE_SECRET_KEY),liveTradingEnabled,defaultMarginUsdc,maxMarginUsdc,
+    gainersEnabled:Boolean(gainers.enabled),
+    gainersMarginUsdc:gainers.marginUsdc==null?null:Number(gainers.marginUsdc),
+    gainersCloseAt:gainers.closeAt==null?null:String(gainers.closeAt),
+    gainersOpenLegs:Array.isArray(gainers.open)?(gainers.open as unknown[]).length:0,
+    gainersTestState:String((gainers.test as {state?:string}|undefined)?.state??"IDLE"),
+    gainersTestLegs:Array.isArray((gainers.test as {legs?:unknown[]}|undefined)?.legs)?((gainers.test as {legs:unknown[]}).legs).length:0
   };
 });
 app.get("/api/settings/secrets/:kind",async(request)=>{
@@ -521,6 +544,87 @@ app.post("/api/settings/coinglass/test",async(request,reply)=>{
     const captured=await requestCoinGlassCapture(url,"24h");
     return {ok:true,url,regionCount:captured.regions.length,capturedAt:captured.capturedAt.toISOString()};
   }catch(error){return reply.code(422).send({error:"COINGLASS_TEST_FAILED",message:error instanceof Error?error.message:String(error)});}
+});
+
+/**
+ * Realised P&L per calendar day, for the calendar page.
+ *
+ * Keyed by the Asia/Shanghai date the basket *closed* on: entry is 23:55 and
+ * the exit lands at 07:55 the next morning, so a night's result belongs to the
+ * morning it settled. Days with several closes — the old two-pass exit emitted
+ * one per direction — are summed into a single cell.
+ *
+ * `priced` counts the legs that actually carried a realizedPnl. The first
+ * baskets predate that field, and reporting them as 0 would put a fake
+ * break-even day on the calendar, so they come back as null instead.
+ */
+app.get("/api/pnl/daily",async()=>{
+  const rows=(await query<{d:string;mode:string;baskets:number;legs:number;pnl:string|null;gross:string|null;fees:string|null;funding:string|null;priced:number;split:number;funded:number}>(`
+    SELECT (o.created_at AT TIME ZONE 'Asia/Shanghai')::date::text d,
+           o.payload->>'mode' mode,
+           count(*)::int baskets,
+           sum(jsonb_array_length(o.payload->'closed'))::int legs,
+           sum(x.pnl)::text pnl,
+           sum(x.gross)::text gross,
+           sum(x.fees)::text fees,
+           sum(x.funding)::text funding,
+           sum(x.priced)::int priced,
+           sum(x.split)::int split,
+           sum(x.funded)::int funded
+    FROM outbox o
+    CROSS JOIN LATERAL (
+      SELECT sum((l->>'realizedPnl')::numeric) pnl,
+             sum((l->>'grossPnl')::numeric) gross,
+             sum(abs((l->>'commission')::numeric)) fees,
+             sum((l->>'funding')::numeric) funding,
+             count(*) FILTER (WHERE l ? 'realizedPnl') priced,
+             count(*) FILTER (WHERE l ? 'grossPnl' AND l ? 'commission') split,
+             count(*) FILTER (WHERE l ? 'funding') funded
+      FROM jsonb_array_elements(o.payload->'closed') l
+    ) x
+    WHERE o.topic='notification.gainers_closed'
+      AND jsonb_array_length(coalesce(o.payload->'closed','[]'::jsonb))>0
+    GROUP BY 1,2 ORDER BY 1`)).rows;
+
+  const byDate=new Map<string,{date:string;realizedPnl:number|null;grossPnl:number|null;funding:number|null;commission:number|null;legs:number;baskets:number;testPnl:number|null;testLegs:number}>();
+  for(const row of rows){
+    const day=byDate.get(row.d)??{date:row.d,realizedPnl:null,grossPnl:null,funding:null,commission:null,legs:0,baskets:0,testPnl:null,testLegs:0};
+    const pnl=row.priced>0&&row.pnl!=null?Number(row.pnl):null;
+    if(row.mode==="测试"){
+      day.testLegs+=row.legs;
+      if(pnl!=null)day.testPnl=(day.testPnl??0)+pnl;
+    }else{
+      day.legs+=row.legs; day.baskets+=row.baskets;
+      if(pnl!=null)day.realizedPnl=(day.realizedPnl??0)+pnl;
+      // Only from legs that carried both halves — a day mixing old and new
+      // records would otherwise show a gross that its net cannot be derived from.
+      if(row.split>0&&row.split===row.priced&&row.gross!=null&&row.fees!=null){
+        day.grossPnl=(day.grossPnl??0)+Number(row.gross);
+        day.commission=(day.commission??0)+Number(row.fees);
+      }
+      // Funding is tracked on its own: it was captured later than the
+      // gross/fee split, so a day can have one without the other.
+      if(row.funded>0&&row.funding!=null)day.funding=(day.funding??0)+Number(row.funding);
+    }
+    byDate.set(row.d,day);
+  }
+  const days=[...byDate.values()].sort((a,b)=>a.date.localeCompare(b.date));
+  const priced=days.filter((d)=>d.realizedPnl!=null);
+  return {
+    days,
+    stats:{
+      tradingDays:days.filter((d)=>d.baskets>0).length,
+      winDays:priced.filter((d)=>d.realizedPnl!>0).length,
+      lossDays:priced.filter((d)=>d.realizedPnl!<0).length,
+      grossPnl:days.filter((d)=>d.grossPnl!=null).reduce((sum,d)=>sum+d.grossPnl!,0),
+      commission:days.filter((d)=>d.commission!=null).reduce((sum,d)=>sum+d.commission!,0),
+      funding:days.filter((d)=>d.funding!=null).reduce((sum,d)=>sum+d.funding!,0),
+      fundingDays:days.filter((d)=>d.funding!=null).length,
+      realizedPnl:priced.reduce((sum,d)=>sum+d.realizedPnl!,0),
+      best:priced.reduce<{date:string;realizedPnl:number}|null>((b,d)=>!b||d.realizedPnl!>b.realizedPnl?{date:d.date,realizedPnl:d.realizedPnl!}:b,null),
+      worst:priced.reduce<{date:string;realizedPnl:number}|null>((w,d)=>!w||d.realizedPnl!<w.realizedPnl?{date:d.date,realizedPnl:d.realizedPnl!}:w,null)
+    }
+  };
 });
 
 app.get("/api/settings/restarts",async()=>
@@ -584,6 +688,54 @@ app.post("/api/settings/telegram/save", async (request,reply) => {
 // trading immediately. Enabling requires a currently valid, reconciled
 // Variational session so the switch can't arm trading against a session
 // that's actually logged out.
+/**
+ * The daily gainers basket switch. Unlike live-trading this needs no restart:
+ * the agent reads app_state every tick, so the toggle takes effect within 30
+ * seconds and a running basket keeps its own close time.
+ */
+app.post("/api/settings/gainers",async(request,reply)=>{
+  const input=z.object({enabled:z.boolean(),marginUsdc:z.number().positive().max(500).nullable().optional()}).parse(request.body);
+  const current=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='gainers_scheduler'")).rows[0]?.value??{};
+  if(input.enabled){
+    if(!liveTradingEnabled)return reply.code(422).send({error:"GAINERS_BLOCKED",message:"真实交易未开启，定时器开了也不会下单"});
+    const session=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='variational_session'")).rows[0]?.value;
+    if(!session?.loggedIn)return reply.code(422).send({error:"GAINERS_BLOCKED",message:"Variational 会话未登录"});
+  }
+  // A running basket keeps closeAt and its leg ids even when switched off, so
+  // the morning exit still fires: turning the scheduler off must not strand
+  // positions it already opened.
+  const next={...current,enabled:input.enabled,...(input.marginUsdc===undefined?{}:{marginUsdc:input.marginUsdc})};
+  await query("INSERT INTO app_state(key,value) VALUES('gainers_scheduler',$1) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=now()",[JSON.stringify(next)]);
+  return {ok:true,...next};
+});
+
+/**
+ * The manual test run. The API holds no Variational session — only the agent
+ * does — so this writes an intent the agent picks up within 30 seconds.
+ */
+app.post("/api/settings/gainers/test",async(request,reply)=>{
+  const input=z.object({running:z.boolean(),marginUsdc:z.number().positive().max(100).optional()}).parse(request.body);
+  const current=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='gainers_scheduler'")).rows[0]?.value??{};
+  const test=(current.test??{state:"IDLE"}) as {state:string;legs?:unknown[]};
+  if(input.running){
+    if(!liveTradingEnabled)return reply.code(422).send({error:"GAINERS_BLOCKED",message:"真实交易未开启，测试不会下单"});
+    const binanceMode=Boolean(config.BINANCE_API_KEY&&config.BINANCE_SECRET_KEY);
+    if(!binanceMode){
+      const session=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='variational_session'")).rows[0]?.value;
+      if(!session?.loggedIn)return reply.code(422).send({error:"GAINERS_BLOCKED",message:"Variational 会话未登录"});
+    }
+    if(test.state!=="IDLE")return reply.code(409).send({error:"GAINERS_TEST_BUSY",message:`测试已在 ${test.state} 状态，不能重复开始`});
+    if(current.closeAt)return reply.code(409).send({error:"GAINERS_BUSY",message:"正式篮子正在持仓中，先等它平掉再测试"});
+    const next={...current,test:{state:"START_REQUESTED",marginUsdc:input.marginUsdc??10}};
+    await query("INSERT INTO app_state(key,value) VALUES('gainers_scheduler',$1) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=now()",[JSON.stringify(next)]);
+    return {ok:true,state:"START_REQUESTED"};
+  }
+  if(test.state==="IDLE")return reply.code(409).send({error:"GAINERS_TEST_IDLE",message:"当前没有在跑的测试"});
+  const next={...current,test:{...test,state:"STOP_REQUESTED"}};
+  await query("INSERT INTO app_state(key,value) VALUES('gainers_scheduler',$1) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=now()",[JSON.stringify(next)]);
+  return {ok:true,state:"STOP_REQUESTED"};
+});
+
 app.post("/api/settings/live-trading",async(request,reply)=>{
   const input=z.object({enabled:z.boolean()}).parse(request.body);
   if(input.enabled){

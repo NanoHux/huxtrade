@@ -1,5 +1,26 @@
 {
-  "name":"@huxtrade/variational-agent","private":true,"type":"module",
-  "dependencies":{"@huxtrade/config":"workspace:*","@huxtrade/database":"workspace:*","@huxtrade/exchange-clients":"workspace:*","@huxtrade/strategy-engine":"workspace:*","playwright-core":"^1.54.0"},
-  "scripts":{"dev":"tsx watch src/index.ts","discover":"tsx src/discovery.ts","discover:har":"tsx src/har-discovery.ts","build":"tsc -p tsconfig.json --outDir dist","start":"tsx src/index.ts","test-order":"tsx src/test-order.ts","test-cancel":"tsx src/test-cancel.ts","test-resting":"tsx src/test-resting.ts","test-scaleout":"tsx src/test-scaleout.ts","typecheck":"tsc --noEmit -p tsconfig.json"}
+  "name": "@huxtrade/variational-agent",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@huxtrade/config": "workspace:*",
+    "@huxtrade/database": "workspace:*",
+    "@huxtrade/exchange-clients": "workspace:*",
+    "@huxtrade/strategy-engine": "workspace:*",
+    "playwright-core": "^1.54.0"
+  },
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "discover": "tsx src/discovery.ts",
+    "discover:har": "tsx src/har-discovery.ts",
+    "build": "tsc -p tsconfig.json --outDir dist",
+    "start": "tsx src/index.ts",
+    "test-order": "tsx src/test-order.ts",
+    "test-cancel": "tsx src/test-cancel.ts",
+    "test-resting": "tsx src/test-resting.ts",
+    "test-scaleout": "tsx src/test-scaleout.ts",
+    "typecheck": "tsc --noEmit -p tsconfig.json",
+    "gainers": "tsx src/gainers.ts",
+    "klines:backfill": "tsx src/klines-backfill.ts"
+  }
 }

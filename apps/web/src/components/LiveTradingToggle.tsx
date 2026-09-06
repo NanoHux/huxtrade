@@ -7,13 +7,13 @@ export function LiveTradingToggle({enabled}:{enabled:boolean}){
   const [message,setMessage]=useState("");
 
   async function toggle(){
-    if(!enabled&&!window.confirm("即将开启真实资金交易：满足条件的策略信号会自动在 Variational 下真实限价单。确认开启？"))return;
-    setBusy(true);setMessage("正在切换并请求重启 Variational Agent…");
+    if(!enabled&&!window.confirm("即将开启真实资金交易：涨幅榜篮子会在每天的建仓时刻自动在 Binance 市价开仓。确认开启？"))return;
+    setBusy(true);setMessage("正在切换并请求重启 variational-agent…");
     try{
       const response=await fetch(`${publicApi}/api/settings/live-trading`,{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({enabled:!enabled})});
       const body=await response.json().catch(()=>({}));
       if(!response.ok){setMessage(`操作失败：${body.message??body.error??"未知错误"}`);return;}
-      setMessage("已切换，Variational Agent 重启后生效；重启结果见下方「密钥更新与服务重启」。");
+      setMessage("已切换，variational-agent 重启后生效。");
     }catch(error){
       setMessage(`请求失败：${error instanceof Error?error.message:String(error)}`);
     }finally{

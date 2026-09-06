@@ -105,7 +105,7 @@ describe("resting order plans",()=>{
   // These assert how the heatmap objective is chosen. It is no longer the
   // default — a fixed multiple of the stop replaced it — but it stays
   // reachable, and the peak-selection rules still need covering.
-  const aimAtPeak=resolveRestingEntry({takeProfitRiskReward:0});
+  const aimAtPeak=resolveRestingEntry({takeProfitRiskReward:0,maxStopLossPercent:0});
   const entryZone=region(96,97,0.9,50),targetZone=region(104.5,105.5,1,100);
   const base={symbol:"BTCUSDT",direction:"LONG" as const,closedAt:"2026-08-07T00:00:00Z",price:100,atr1h:2,marginUsdc:10,leverage:5};
 
@@ -154,6 +154,38 @@ describe("resting order plans",()=>{
     // objective is the 95 cluster; the strong one becomes the objective itself.
     expect(makeRestingOrderPlan({...base,direction:"SHORT",candidate,regions:[weak,objective]},aimAtPeak).heatmapTarget?.price).toBe(95);
     expect(makeRestingOrderPlan({...base,direction:"SHORT",candidate,regions:[strong,objective]},aimAtPeak).heatmapTarget?.price).toBe(96.75);
+  });
+
+  it("caps the stop at the share of margin one trade may lose",()=>{
+    // Structure wants the stop at 89 (swing 90 less 0.5 ATR), an 11% risk that
+    // at 5x costs 55% of the margin. 10% of margin at 5x is 2% of price, so
+    // the stop comes in to 98 and the 2R target follows it to 104.
+    const capped=resolveRestingEntry({maxStopLossPercent:10});
+    const plan=makeRestingOrderPlan({...base,candidate:{level:100,score:1,sources:["SWING"],swing:90},regions:[]},capped);
+    expect(plan.stopLoss).toBeCloseTo(98,9);
+    expect(plan.takeProfit).toBeCloseTo(104,9);
+  });
+
+  it("leaves a stop already inside the cap where the structure put it",()=>{
+    // Risk 1.1 against a ceiling of 2 — the cap is a ceiling, not a target,
+    // and must never push a stop further out than the structure asked for.
+    const capped=resolveRestingEntry({maxStopLossPercent:10});
+    const plan=makeRestingOrderPlan({...base,atr1h:0.2,candidate:{level:100,score:1,sources:["SWING"],swing:99},regions:[]},capped);
+    expect(plan.stopLoss).toBeCloseTo(98.9,9);
+  });
+
+  it("tightens the same loss cap as leverage rises",()=>{
+    // The operator sets one number — 10% of margin — and leverage decides what
+    // that is in price. At 10x it is 1%, so the same setup stops at 99.
+    const capped=resolveRestingEntry({maxStopLossPercent:10});
+    const plan=makeRestingOrderPlan({...base,leverage:10,candidate:{level:100,score:1,sources:["SWING"],swing:90},regions:[]},capped);
+    expect(plan.stopLoss).toBeCloseTo(99,9);
+  });
+
+  it("lets 0 turn the cap off rather than reading it as unset",()=>{
+    const uncapped=resolveRestingEntry({maxStopLossPercent:0});
+    const plan=makeRestingOrderPlan({...base,candidate:{level:100,score:1,sources:["SWING"],swing:90},regions:[]},uncapped);
+    expect(plan.stopLoss).toBeCloseTo(89,9);
   });
 
   it("mirrors the SHORT stop off the zone's high edge",()=>{

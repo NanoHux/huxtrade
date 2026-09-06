@@ -40,7 +40,11 @@ describe("PostgreSQL migrations",()=>{
       const session=await db.query<{reconciled:boolean}>("SELECT (value->>'reconciled')::boolean reconciled FROM app_state WHERE key='variational_session'");
       expect(session.rows[0]?.reconciled).toBe(false);
       const preferences=await db.query<{count:number}>("SELECT count(*)::int count FROM notification_preferences");
-      expect(preferences.rows[0]?.count).toBe(19);
+      expect(preferences.rows[0]?.count).toBe(21);
+      // 022 ships the gainers switch OFF: a scheduler that places real orders
+      // is turned on by an operator, never inherited from a migration.
+      const gainers=await db.query<{enabled:boolean}>("SELECT (value->>'enabled')::boolean enabled FROM app_state WHERE key='gainers_scheduler'");
+      expect(gainers.rows[0]?.enabled).toBe(false);
       const replaced=await db.query<{enabled:boolean}>("SELECT enabled FROM notification_preferences WHERE event_type='resting_order_replaced'");
       expect(replaced.rows[0]?.enabled).toBe(false);
       // 014 hands over a switch without flipping it: venue limits keep

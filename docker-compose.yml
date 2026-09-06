@@ -27,7 +27,7 @@ services:
     env_file: .env
     environment: { NODE_ENV: production }
     volumes: ["./.env:/app/.env"]
-    ports: ["127.0.0.1:4000:4000"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:4000:4000"]
     depends_on:
       migrate: { condition: service_completed_successfully }
     restart: unless-stopped
@@ -42,10 +42,11 @@ services:
       context: .
       args:
         APP_FILTER: "@huxtrade/web"
-        NEXT_PUBLIC_API_URL: "${NEXT_PUBLIC_API_URL:-http://localhost:4000}"
+        NEXT_PUBLIC_API_URL: "${NEXT_PUBLIC_API_URL-}"
+        API_INTERNAL_URL: "${API_INTERNAL_URL:-http://api:4000}"
     env_file: .env
     environment: { NODE_ENV: production }
-    ports: ["127.0.0.1:3000:3000"]
+    ports: ["${BIND_ADDR:-127.0.0.1}:3000:3000"]
     depends_on:
       api: { condition: service_healthy }
     restart: unless-stopped

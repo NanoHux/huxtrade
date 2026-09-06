@@ -151,9 +151,23 @@ function composePlan(input: {
 }, settings: RestingEntrySettings = restingEntryDefaults): OrderPlan {
   const { direction, entryPrice, atr1h, structuralAnchor } = input;
   if (structuralAnchor === undefined) throw new Error("no price structure to place a stop behind");
-  const stopLoss = direction === "LONG" ? structuralAnchor - fixedRules.stopAtrBuffer * atr1h : structuralAnchor + fixedRules.stopAtrBuffer * atr1h;
-  const risk = direction === "LONG" ? entryPrice - stopLoss : stopLoss - entryPrice;
-  if (!(risk > 0)) throw new Error("the structural stop sits on the wrong side of the entry");
+  const structuralStop = direction === "LONG" ? structuralAnchor - fixedRules.stopAtrBuffer * atr1h : structuralAnchor + fixedRules.stopAtrBuffer * atr1h;
+  const structuralRisk = direction === "LONG" ? entryPrice - structuralStop : structuralStop - entryPrice;
+  if (!(structuralRisk > 0)) throw new Error("the structural stop sits on the wrong side of the entry");
+  // A ceiling on what one trade may cost, expressed where the operator thinks
+  // about it: a share of the margin. Leverage turns it into a price distance —
+  // 10% of margin at 5x is 2% of price. Without it, margin is constant while
+  // the structural stop is not, so risk per trade tracked whatever the ATR
+  // happened to be: over 30 days the stops ranged 0.06% to 23.84% of entry, a
+  // 400x spread, and a single 23.84% stop on DEXE lost 119 USDC against the
+  // 2.50 a median stop risked. The cost is real and accepted — a stop that no
+  // longer sits behind the structure gets hit by noise the structure would
+  // have absorbed.
+  const ceiling = settings.maxStopLossPercent > 0 && input.leverage > 0
+    ? entryPrice * (settings.maxStopLossPercent / 100) / input.leverage
+    : Infinity;
+  const risk = Math.min(structuralRisk, ceiling);
+  const stopLoss = direction === "LONG" ? entryPrice - risk : entryPrice + risk;
   const target = chooseHeatmapTarget(input.regions, direction, entryPrice);
   // A fixed distance, when configured. The peak is still resolved and still
   // travels on the plan, so the ledger keeps recording what it would have
@@ -211,7 +225,7 @@ export function resolveRestingEntry(overrides?:Partial<RestingEntrySettings>|nul
   // positive-only merge above would have silently ignored it.
   // 0 is meaningful for each of these — it switches the rule off — so the
   // positive-only merge above would silently restore the default instead.
-  for(const key of ["extremeMoveBlockPercent","lossStreakCount","structuralRejectionLimit","virtualEntryConfirmation","takeProfitRiskReward"] as const){
+  for(const key of ["extremeMoveBlockPercent","lossStreakCount","structuralRejectionLimit","virtualEntryConfirmation","takeProfitRiskReward","maxStopLossPercent"] as const){
     const value=overrides?.[key];
     if(typeof value==="number"&&Number.isFinite(value)&&value>=0)resolved[key]=value;
   }

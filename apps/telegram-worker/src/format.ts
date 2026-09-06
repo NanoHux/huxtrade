@@ -195,3 +195,118 @@ export function formatGeneric(topic:string,payload:Record<string,unknown>){
   }
   return lines.join("\n");
 }
+
+/**
+ * The evening's basket. The unmatched names are the point of this message:
+ * they are the difference between the strategy that was measured and the one
+ * that actually ran, and nothing else surfaces them.
+ */
+export function formatGainersBasket(payload:Record<string,unknown>){
+  const mode=payload.mode?`${String(payload.mode)} · `:"";
+  const matched=Array.isArray(payload.matched)?payload.matched as Array<Record<string,unknown>>:[];
+  const unmatched=Array.isArray(payload.unmatched)?payload.unmatched as Array<Record<string,unknown>>:[];
+  const lev=typeof payload.leverage==="number"?payload.leverage:2;
+  const lbHours=typeof payload.lookbackHours==="number"?payload.lookbackHours:52;
+  const longs=Number(payload.longs??0),shorts=Number(payload.shorts??0);
+  const title=shorts===0?`纯多头 ${longs} 腿`:`多空组合 —— 多 ${longs} / 空 ${shorts}`;
+  const lines=[`📊 ${mode}${title}，${lev}x 杠杆，${lbHours}h 榜单，跳过 ${unmatched.length}`];
+  if(payload.skew)lines.push(String(payload.skew));
+  if(matched.length){
+    lines.push("","已下单：");
+    for(const m of matched)lines.push(`  ${String(m.direction)==="SHORT"?"空":"多"} ${m.base} ${Number(m.changePercent)>=0?"+":""}${Number(m.changePercent).toFixed(1)}%${m.entryId?"":`  ⚠ ${m.error?String(m.error).slice(0,40):"提交失败"}`}`);
+  }
+  if(unmatched.length){
+    lines.push("","排名更高但跳过的：");
+    for(const u of unmatched){
+      const similar=Array.isArray(u.similar)?u.similar as string[]:[];
+      const why=u.reason?`（${String(u.reason)}）`:"";
+      lines.push(`  ${String(u.direction)==="SHORT"?"空":"多"} ${u.base} ${Number(u.changePercent)>=0?"+":""}${Number(u.changePercent).toFixed(1)}%${why}${similar.length?`   相似名：${similar.join(" ")}`:""}`);
+    }
+  }
+  // Say whether the night is lost or the agent is still trying, so a first
+  // failure is not read as the final word on the basket.
+  if(payload.error)lines.push("",`⚠ ${String(payload.error)}`,
+    payload.willRetry===true?"仍在补开，2 小时窗口内每 30 秒重试一次；成功或放弃都会再发一条。"
+    :payload.willRetry===false?"已有订单发出，不会重试，请去 Binance 核对持仓。":"");
+  return lines.join("\n");
+}
+
+/** The morning exit, reported whether or not every leg came off cleanly. */
+/**
+ * A fill price at readable precision. Raw venue floats arrive as
+ * 0.00457501985085415, which is fifteen digits of noise around six that matter.
+ */
+const price=(value:unknown)=>{
+  if(value==null)return "";
+  const n=Number(value);
+  if(!Number.isFinite(n)||n===0)return "";
+  return String(Number(n.toPrecision(6)));
+};
+
+/** Amounts always carry their sign, so a fee line never reads as income. */
+const signed=(n:number)=>`${n>=0?"+":"-"}${Math.abs(n).toFixed(2)}`;
+
+export function formatGainersClosed(payload:Record<string,unknown>){
+  const closed=Array.isArray(payload.closed)?payload.closed as Array<Record<string,unknown>>:[];
+  const failed=closed.filter((c)=>!c.ok);
+  const scope=payload.scope?`（${String(payload.scope)}）`:"";
+  const day=payload.tradingDay==null?"":` · 第 ${Number(payload.tradingDay)} 天`;
+  const lines=[`📉 ${payload.mode?`${String(payload.mode)} · `:""}平仓${scope}${day} —— ${closed.length-failed.length}/${closed.length} 成功`];
+  if(!closed.length)lines.push("账户本来就是空仓。");
+  let total=0,gross=0,fees=0,funding=0,known=0,split=0,fundingKnown=0;
+  for(const c of closed){
+    const side=c.qty===undefined?"":` ${Number(c.qty)>0?"多":"空"}`;
+    if(!c.ok){lines.push(`  ${c.symbol}${side} 平仓失败：${c.error??"未知"}`);continue;}
+    const pnl=c.realizedPnl==null?null:Number(c.realizedPnl);
+    if(pnl!==null){total+=pnl;known+=1;}
+    // Older records carry only the net figure, so the breakdown is shown for
+    // the legs that have it rather than faked as zero fees for the ones that don't.
+    const hasSplit=c.grossPnl!=null&&c.commission!=null;
+    if(hasSplit){gross+=Number(c.grossPnl);fees+=Number(c.commission);split+=1;}
+    if(c.funding!=null){funding+=Number(c.funding);fundingKnown+=1;}
+    // == null, not === undefined: a missing exit price used to arrive as JSON
+    // null (NaN serialised) and printed the word "null" as the fill price.
+    const entry=price(c.entryPrice),exit=price(c.exitPrice);
+    const prices=entry&&exit?`  ${entry} → ${exit}`:entry?`  ${entry} → ?`:"";
+    // Legs that took themselves off before the clock ran out.
+    const reason=c.exitReason?` [${String(c.exitReason)}]`:"";
+    lines.push(`  ${c.symbol}${side} ${Math.abs(Number(c.qty))}${prices}${reason}  ${pnl===null?"盈亏未知":`${signed(pnl)} USDC`}`);
+    // Funding first among the costs — over an eight-hour hold it dwarfs the
+    // commission, and it is the one the operator steers by.
+    if(hasSplit)lines.push(`      涨跌 ${signed(Number(c.grossPnl))}`
+      +(c.funding!=null?`   资金费 ${signed(Number(c.funding))}`:"")
+      +`   手续费 ${signed(-Math.abs(Number(c.commission)))}`);
+  }
+  // Only sum what actually came back with a settlement: a total that silently
+  // treats an unknown leg as zero reads as a smaller loss than the real one.
+  if(known){
+    const missing=closed.filter((c)=>c.ok).length-known;
+    lines.push("",`已实现合计 ${signed(total)} USDC${missing?`（${missing} 笔盈亏未取到，未计入）`:""}`);
+    if(split)lines.push(`  涨跌 ${signed(gross)}`
+      +(fundingKnown?`   资金费 ${signed(funding)}`:"")
+      +`   手续费 ${signed(-Math.abs(fees))}${split<known?`（${known-split} 笔无拆分数据）`:""}`);
+  }
+  if(payload.balanceUsdc!=null)lines.push(`账户余额 ${Number(payload.balanceUsdc).toFixed(2)} USDC`);
+  if(failed.length){
+    const platform=String(payload.platform??"variational")==="binance"?"Binance":"Variational";
+    lines.push("",`⚠ 有仓位没平掉，去 ${platform} 界面确认。`);
+  }
+  return lines.join("\n");
+}
+
+/** One coin of the basket, sent as it is placed. */
+export function formatGainersLeg(payload:Record<string,unknown>){
+  const mode=String(payload.mode??"");
+  const base=String(payload.base??"?"),change=Number(payload.changePercent);
+  const lbHours=typeof payload.lookbackHours==="number"?payload.lookbackHours:52;
+  const lev=typeof payload.leverage==="number"?payload.leverage:2;
+  if(payload.error)return [`❌ ${mode} 开仓失败 ${base}`,`${lbHours}h 涨跌 ${change>=0?"+":""}${change.toFixed(1)}%`,String(payload.error)].join("\n");
+  const dir=String(payload.direction??"LONG")==="SHORT"?"空单":"多单";
+  const lines=[`✅ ${mode} 已开 ${base} ${lev}x${dir}`,`${lbHours}h 涨跌 ${change>=0?"+":""}${change.toFixed(1)}%`];
+  if(payload.margin!==undefined)lines.push(`保证金 ${Number(payload.margin).toFixed(2)} USDC`);
+  if(payload.entryPrice!==undefined)lines.push(`入场 ${payload.entryPrice}`);
+  if(payload.takeProfit!==undefined)lines.push(`止盈 ${Number(payload.takeProfit).toPrecision(6)}（+15%）`);
+  if(payload.stopLoss!==undefined)lines.push(`止损 ${Number(payload.stopLoss).toPrecision(6)}（-80%）`);
+  if(payload.quantity!==undefined)lines.push(`数量 ${payload.quantity}`);
+  return lines.join("\n");
+}

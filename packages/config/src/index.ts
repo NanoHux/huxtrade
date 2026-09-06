@@ -36,6 +36,8 @@ const schema = z.object({
   API_PORT: z.coerce.number().int().positive().default(4000),
   WEB_ORIGIN: z.string().default("http://localhost:3000"),
   BINANCE_FUTURES_BASE_URL: z.string().url().default("https://fapi.binance.com"),
+  BINANCE_API_KEY: z.string().default(""),
+  BINANCE_SECRET_KEY: z.string().default(""),
   COINGLASS_ADAPTER_MODE: z.enum(["disabled","browser"]).default("disabled"),
   COINGLASS_PROFILE_PATH: z.string().default("./coinglass-profile"),
   COINGLASS_BROWSER_EXECUTABLE: z.string().default(""),
@@ -80,7 +82,7 @@ export function getConfig(): AppConfig {
   if (cached.MARGIN_RESUME_PERCENT >= cached.MARGIN_PAUSE_PERCENT) {
     throw new Error("MARGIN_RESUME_PERCENT must be lower than MARGIN_PAUSE_PERCENT");
   }
-  if(cached.LIVE_TRADING_ENABLED&&cached.VARIATIONAL_ADAPTER_MODE!=="browser-fetch")throw new Error("LIVE_TRADING_ENABLED requires the implemented browser-fetch Variational adapter");
+  if(cached.LIVE_TRADING_ENABLED&&cached.VARIATIONAL_ADAPTER_MODE!=="browser-fetch"&&!cached.BINANCE_API_KEY)throw new Error("LIVE_TRADING_ENABLED requires either the browser-fetch Variational adapter or a BINANCE_API_KEY");
   if(cached.VARIATIONAL_ADAPTER_MODE==="browser-fetch"&&!cached.VARIATIONAL_BASE_URL)throw new Error("VARIATIONAL_BASE_URL is required for browser-fetch mode");
   if(cached.VARIATIONAL_CDP_URL){
     const url=new URL(cached.VARIATIONAL_CDP_URL);
@@ -302,6 +304,7 @@ export const fixedRules = Object.freeze({
     // artefact, not a rule. At a 0.5 ATR stop the row rises smoothly from
     // 1.0R to 3.0R and 2.0R pays the same as 3.0R while resolving sooner.
     takeProfitRiskReward: 2,
+    maxStopLossPercent: 10,
     virtualEntryConfirmation: 1,
     // Confirmation runs on the close of 5m candles.
     virtualEntryIntervalMinutes: 5

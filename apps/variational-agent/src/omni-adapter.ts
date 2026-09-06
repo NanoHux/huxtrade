@@ -13,6 +13,13 @@ export interface OmniTransport{
 }
 
 export interface VariationalAdapter extends ProtectionAdapter{
+  /** Everything the venue lists — the gainers basket's universe. */
+  supportedAssets?():Promise<unknown>;
+  /** Flattens every open position, including ones this process did not open. */
+  livePositions?():Promise<Array<{symbol:string;qty:number;entryPrice:number|null;markPrice:number|null;unrealizedPnl:number|null;openedAt:string|null}>>;
+  closeAllPositions?():Promise<Array<{symbol:string;ok:boolean;qty:number;entryPrice?:number;exitPrice?:number;realizedPnl?:number;error?:string}>>;
+  /** Market entry with protection attached. Optional: the disabled adapter has none. */
+  submitMarketEntry?(value:Record<string,unknown>,options?:{skipProtection?:boolean}):Promise<PlatformEntry>;
   sessionValid():Promise<boolean>;
   account():Promise<{balanceUsdc:number;marginUsagePercent:number}>;
   minimumMargin(plan:OrderPlan):Promise<number>;
@@ -121,7 +128,13 @@ export function quantizePlanPrices(plan:OrderPlan,places:number):QuantizedPrices
   const reward=long?target-entry:entry-target;
   if(!(risk>0))throw new Error("Variational price quantization collapsed the stop-loss distance");
   const expectedRiskReward=reward/risk;
-  if(expectedRiskReward<fixedRules.minimumRiskReward-1e-9)throw new Error(`quantized risk/reward ${expectedRiskReward.toFixed(3)} is below ${fixedRules.minimumRiskReward} at ${places} price decimals`);
+  // The floor belongs to the resting-limit model, where the target IS the exit
+  // and a ratio under 1.4 means the trade cannot pay for its own stop. A basket
+  // that exits on a clock has no such relationship, and for a short the floor
+  // is unreachable by construction: the most a short can make is the entry
+  // price itself, so an 80% stop caps the ratio at 1/0.8 = 1.25 whatever the
+  // target is. Applying it there rejected every short leg on 2026-08-12.
+  if(!plan.timeExit&&expectedRiskReward<fixedRules.minimumRiskReward-1e-9)throw new Error(`quantized risk/reward ${expectedRiskReward.toFixed(3)} is below ${fixedRules.minimumRiskReward} at ${places} price decimals`);
   return {entryPrice,takeProfit,stopLoss,decimals:places,expectedRiskReward};
 }
 
@@ -210,6 +223,9 @@ export class OmniBrowserAdapter implements VariationalAdapter{
    * the guard that exists to catch exactly this was blinded by its own cache.
    */
   /** The venue's own bid/ask spread for this plan's size, in price units. */
+  /** Everything the venue lists, keyed by asset — the gainers basket's universe. */
+  async supportedAssets(){return this.transport.request("/api/metadata/supported_assets");}
+
   async quotedSpread(plan:OrderPlan){
     const prepared=await this.prepare(plan);
     const bid=optionalNumber(prepared.quote.bid),ask=optionalNumber(prepared.quote.ask);
@@ -247,6 +263,42 @@ export class OmniBrowserAdapter implements VariationalAdapter{
     const id=string(response.rfq_id,"entry RFQ ID");
     this.submissions.set(id,{prepared,response});
     return {id,state:"PENDING_ENTRY",quantity:Number(prepared.qty),submittedPrices:prepared.prices,raw:response};
+  }
+
+  /**
+   * Market entry: quote, then accept it as an order with protection attached.
+   *
+   * `/api/orders/new/market` was mapped during discovery but never called, so
+   * this is its first live use — it is deliberately built to mirror
+   * submitEntry's protection block field for field, since that block is the
+   * one part of the shape already proven against the venue.
+   *
+   * Unlike the limit path there is no resting order: the response either
+   * describes a fill or the request failed, so the caller gets FILLED_OPEN
+   * rather than PENDING_ENTRY.
+   */
+  async submitMarketEntry(value:Record<string,unknown>,options?:{skipProtection?:boolean}):Promise<PlatformEntry>{
+    const plan=asPlan(value),prepared=await this.prepare(plan);
+    const {takeProfit,stopLoss}=prepared.prices;
+    const quote=await this.indicative(prepared.instrument,prepared.qty);
+    const protection=options?.skipProtection?{}:{
+      take_profit:takeProfit,tp_is_auto_resize:true,tp_use_mark_price:true,tp_slippage_limit:this.config.VARIATIONAL_PROTECTION_SLIPPAGE.toString(),
+      stop_loss:stopLoss,sl_is_auto_resize:true,sl_use_mark_price:true,sl_slippage_limit:this.config.VARIATIONAL_PROTECTION_SLIPPAGE.toString()
+    };
+    const body={
+      quote_id:string(quote.quote_id,"market entry quote ID"),side:prepared.side,
+      // A number, not a string. The limit endpoint takes slippage_limit as a
+      // string and copying that here produced "expected f64" on every order;
+      // closeMarket has always passed max_slippage unstringified, and that is
+      // the shape the quote-based endpoints actually accept.
+      max_slippage:this.config.VARIATIONAL_ENTRY_SLIPPAGE,
+      ...protection,
+      is_reduce_only:false
+    };
+    const response=record(await this.transport.request("/api/orders/new/market",{method:"POST",body}),"market order");
+    const id=string(response.rfq_id,"entry RFQ ID");
+    this.submissions.set(id,{prepared,response});
+    return {id,state:"FILLED_OPEN",quantity:Number(prepared.qty),submittedPrices:prepared.prices,raw:response};
   }
 
   async placeTakeProfit(entry:PlatformEntry,_plan:OrderPlan):Promise<PlatformProtection>{
@@ -336,6 +388,69 @@ export class OmniBrowserAdapter implements VariationalAdapter{
   }
 
   private positionData(item:JsonRecord):{info:JsonRecord;instrument:unknown;qty:number}{const info=record(item.position_info,"position info");return {info,instrument:info.instrument,qty:number(info.qty,"position quantity")};}
+
+/**
+   * Flattens the account: every open position, whoever opened it.
+   *
+   * closeMarket can only reach positions it can trace back to an entry rfq,
+   * which leaves anything opened by hand invisible — on 2026-08-10 a manual BMT
+   * position had to be registered by hand so the morning exit would include it.
+   * This drives off the position list instead, so "close everything" needs no
+   * bookkeeping to be correct.
+   *
+   * Same protocol as closeMarket — indicative quote, then accept reduce-only —
+   * because that path is proven against the venue; only the way the quantity
+   * is chosen differs.
+   */
+/** Open positions as the venue reports them, for anything that cannot ask it directly. */
+  async livePositions(){
+    return (await this.positions()).map((item)=>{
+      const data=this.positionData(item),price=isRecord(item.price_info)?item.price_info:{};
+      return {
+        symbol:String((data.instrument as {underlying?:unknown})?.underlying??"?"),
+        qty:data.qty,
+        entryPrice:optionalNumber(data.info.avg_entry_price)??null,
+        markPrice:optionalNumber(price.price)??null,
+        unrealizedPnl:optionalNumber(item.upnl)??null,
+        openedAt:data.info.opened_at==null?null:String(data.info.opened_at)
+      };
+    }).filter((row)=>Number.isFinite(row.qty)&&row.qty!==0);
+  }
+
+  async closeAllPositions(){
+    const results:Array<{symbol:string;ok:boolean;qty:number;entryPrice?:number;exitPrice?:number;realizedPnl?:number;error?:string}>=[];
+    for(const item of await this.positions()){
+      const data=this.positionData(item);
+      const symbol=String((data.instrument as {underlying?:unknown})?.underlying??"?");
+      if(!Number.isFinite(data.qty)||data.qty===0)continue;
+      const entryPrice=optionalNumber(data.info.avg_entry_price);
+      try{
+        const qty=positiveString(Math.abs(data.qty),"close quantity");
+        const quote=await this.indicative(data.instrument as Instrument,qty);
+        const side=data.qty>0?"sell":"buy";
+        const accepted=record(await this.transport.request("/api/quotes/accept",{method:"POST",body:{
+          quote_id:string(quote.quote_id,"close quote ID"),side,
+          max_slippage:this.config.VARIATIONAL_CLOSE_SLIPPAGE,is_reduce_only:true}}),"close quote acceptance");
+        const closeRfq=string(accepted.rfq_id,"close RFQ ID");
+        let flat=false;
+        for(let attempt=0;attempt<10&&!flat;attempt+=1){
+          await delay(500);
+          const after=(await this.positions()).find((row)=>sameInstrument(this.positionData(row).instrument,data.instrument));
+          flat=!after||Math.abs(this.positionData(after).qty)<1e-12;
+        }
+        // The realised amount is read back by the close's own rfq rather than
+        // inferred from prices: Variational nets every order on an instrument
+        // into one position, so a price-difference estimate would be wrong the
+        // moment anything else touched the same market.
+        const settlement=await this.closeSettlement(closeRfq).catch(()=>undefined);
+        results.push({symbol,ok:flat,qty:data.qty,entryPrice,
+          exitPrice:settlement?.fill?.price,realizedPnl:settlement?.realizedPnl});
+      }catch(error){
+        results.push({symbol,ok:false,qty:data.qty,entryPrice,error:error instanceof Error?error.message:String(error)});
+      }
+    }
+    return results;
+  }
 
   async closeMarket(entryId:string){
     const cached=this.submissions.get(entryId),[positions,trades]=await Promise.all([this.positions(),this.trades()]);

@@ -15,6 +15,7 @@ variational-discovery/
 *.har
 *-variational-sanitized.jsonl
 .codex/
+.claude/settings.local.json
 *.log
 *.tsbuildinfo
 .DS_Store

@@ -6,12 +6,15 @@ import type { OrderPlan,OrderState } from "@huxtrade/shared-types";
 import { decideAssetConflict,decideReversalClose,notificationTopicsForTransition,reconcileProtectionState,submitWithInitialProtection,type PlatformEntry,type PlatformEntryState,type PlatformProtection,type PlatformTrackedOrder,type ProtectionAdapter } from "./execution.js";
 import { BrowserFetchTransport,isRetryableEntryRejection,isTransientVenueRejection,VariationalRequestError } from "./browser-fetch-transport.js";
 import { OmniBrowserAdapter,type TrackedOrderRef,type VariationalAdapter } from "./omni-adapter.js";
+import { BinanceFuturesAdapter } from "./binance-futures.js";
+import { aliasesFrom,binanceGainers,BASKET,buildPlans,DEPLOY_FRACTION,HOLD_HOURS,LEVERAGE,LONG_WEIGHT,LOOKBACK_HOURS,OPEN_HOUR_UTC,OPEN_MINUTE_UTC,parseVenueAssets,refreshKlines,selectPair } from "./gainers-core.js";
 
 const config=getConfig();
 const sleep=(ms:number)=>new Promise((resolve)=>setTimeout(resolve,ms));
 class DisabledAdapter implements VariationalAdapter{
   async sessionValid(){return false;}
   async account():Promise<{balanceUsdc:number;marginUsagePercent:number}>{throw new Error("Variational adapter is disabled");}
+  async supportedAssets():Promise<unknown>{throw new Error("Variational adapter is disabled");}
   async minimumMargin(_plan:OrderPlan):Promise<number>{throw new Error("Variational adapter is disabled");}
   async quotedSpread(_plan:OrderPlan):Promise<number|undefined>{return undefined;}
   async submitEntry(_plan:Record<string,unknown>):Promise<PlatformEntry>{throw new Error("Variational adapter is disabled");}
@@ -30,9 +33,11 @@ class DisabledAdapter implements VariationalAdapter{
   async placeProtection(_input:{symbol:string;kind:"take_profit"|"stop_loss";direction:"LONG"|"SHORT";triggerPrice:number}):Promise<{id:string;triggerPrice:string;raw:unknown}>{throw new Error("Variational adapter is disabled");}
 }
 
-const adapter:VariationalAdapter=config.VARIATIONAL_ADAPTER_MODE==="browser-fetch"
-  ?new OmniBrowserAdapter(new BrowserFetchTransport(config),config)
-  :new DisabledAdapter();
+const adapter:VariationalAdapter=config.BINANCE_API_KEY&&config.BINANCE_SECRET_KEY
+  ?new BinanceFuturesAdapter(config.BINANCE_API_KEY,config.BINANCE_SECRET_KEY,config.BINANCE_FUTURES_BASE_URL)
+  :config.VARIATIONAL_ADAPTER_MODE==="browser-fetch"
+    ?new OmniBrowserAdapter(new BrowserFetchTransport(config),config)
+    :new DisabledAdapter();
 
 const closedOrderStates=["CLOSED_TP","CLOSED_SL","CLOSED_REVERSED","LIQUIDATED","CANCELLED_EXTERNALLY"];
 
@@ -828,16 +833,417 @@ async function rejectWithoutSubmission(item:Record<string,unknown>,reason:string
   await query("UPDATE outbox SET status='sent',sent_at=now(),payload=payload||$1::jsonb WHERE id=$2",[JSON.stringify({rejectedWithoutSubmission:true,reason}),item.id]);
 }
 
+
+// ---------------------------------------------------------------------------
+// Daily gainers basket
+// ---------------------------------------------------------------------------
+
+type GainersLeg={symbol:string;entryId:string};
+type GainersTest={state:"IDLE"|"START_REQUESTED"|"RUNNING"|"STOP_REQUESTED";marginUsdc?:number;legs?:GainersLeg[];startedAt?:string};
+type GainersPosition={symbol:string;qty:number;entryPrice:number|null;markPrice:number|null;unrealizedPnl:number|null;openedAt:string|null};
+type FillShorts={state:"REQUESTED"|"RUNNING"|"DONE";requestedAt?:string};
+type GainersState={enabled?:boolean;fillShorts?:FillShorts;marginUsdc?:number|null;lastOpenDay?:string;
+  /** The day an open failure was already reported, so retries stay quiet. */
+  openErrorDay?:string;
+  closeAt?:string;open?:GainersLeg[];test?:GainersTest;positions?:GainersPosition[];positionsAt?:string};
+const readGainers=async():Promise<GainersState>=>
+  ((await query<{value:GainersState}>("SELECT value FROM app_state WHERE key='gainers_scheduler'")).rows[0]?.value)??{};
+const writeGainers=async(next:GainersState)=>{
+  await query("INSERT INTO app_state(key,value) VALUES('gainers_scheduler',$1) ON CONFLICT(key) DO UPDATE SET value=$1,updated_at=now()",[JSON.stringify(next)]);
+};
+const notify=async(event:string,payload:Record<string,unknown>)=>{
+  await query("INSERT INTO outbox(topic,payload) VALUES($1,$2)",[`notification.${event}`,JSON.stringify(payload)]);
+};
+
+
+/**
+ * Opens a basket at market and reports each leg on its own.
+ *
+ * Per-leg messages rather than one summary: the operator asked to see each
+ * coin as it goes on, and a single end-of-run digest hides which leg failed
+ * when only some of them do.
+ */
+/**
+ * `progress` lets the caller tell a failure that never reached the venue from
+ * one that did. Only the first is safe to retry, and only the second leaves
+ * positions that still need closing — and this function can throw on either
+ * side of the submit loop.
+ */
+type OpenProgress={submitted:boolean;legs:GainersLeg[]};
+
+async function openGainersBasket(perLegOverride:number|null,mode:"测试"|"正式",progress?:OpenProgress){
+  if(!adapter.supportedAssets||!adapter.submitMarketEntry)throw new Error("当前 adapter 无法市价开仓（Variational 未启用）");
+  const account=await adapter.account();
+  const aliases=aliasesFrom((await query<{binance_symbol:string;variational_url:string}>("SELECT binance_symbol,variational_url FROM assets")).rows);
+  const [ranked,venueRaw]=await Promise.all([binanceGainers(),adapter.supportedAssets()]);
+  const venue=parseVenueAssets(venueRaw);
+  const {longs,shorts,matched,unmatched}=selectPair(ranked,venue,aliases);
+  const budget=perLegOverride&&perLegOverride>0?perLegOverride*matched.length:account.balanceUsdc*DEPLOY_FRACTION;
+  const margins=perLegOverride&&perLegOverride>0
+    ?{long:perLegOverride,short:perLegOverride}
+    :{long:longs.length?budget*LONG_WEIGHT/longs.length:0,short:shorts.length?budget*(1-LONG_WEIGHT)/shorts.length:0};
+  // The account may already be carrying margin from something else; opening on
+  // top of that is how a basket ends up half-filled with the rest rejected.
+  // Binance 模式下篮子独占账户，不需要保证金占用检查。
+  // Variational 模式保留原有检查：账户可能同时有策略引擎订单。
+  if(!(adapter instanceof BinanceFuturesAdapter)&&account.marginUsagePercent>=40)throw new Error(`保证金占用已达 ${account.marginUsagePercent.toFixed(0)}%，不开新仓（本策略需要约 ${(100*DEPLOY_FRACTION).toFixed(0)}% 空间）`);
+  // A pair that matched only one side is no longer market-neutral, and the
+  // whole reason for running it was to remove direction. Say so rather than
+  // let the operator read a one-sided book as hedged.
+  const skew=LONG_WEIGHT>=1?undefined
+    :longs.length===0||shorts.length===0
+      ?`⚠ 只匹配到${longs.length?"多头":"空头"}腿，本次为单边持仓，没有对冲`
+      :Math.abs(longs.length-shorts.length)>=2
+        ?`⚠ 多空腿数不平衡（多 ${longs.length} / 空 ${shorts.length}），对冲不完整`:undefined;
+  const plans=buildPlans(matched,margins);
+  const legs:GainersLeg[]=[];
+  const report:Array<Record<string,unknown>>=[];
+  for(const plan of plans){
+    const pick=matched.find((m:{base:string})=>m.base===plan.venueSymbol)!;
+    const leg:Record<string,unknown>={mode,base:pick.base,direction:plan.direction,changePercent:pick.changePercent,margin:plan.marginUsdc,entryPrice:plan.entryPrice,stopLoss:plan.stopLoss,takeProfit:plan.takeProfit,leverage:LEVERAGE,lookbackHours:LOOKBACK_HOURS};
+    try{
+      const floor=await adapter.minimumMargin(plan);
+      // The venue silently re-quotes below its minimum notional — ON filled at
+      // 15x its intended size that way. Refuse rather than size by accident.
+      if(floor>plan.marginUsdc*1.05)throw new Error(`平台最低名义 ${floor.toFixed(2)} USDC，超过计划的 ${plan.marginUsdc.toFixed(2)}`);
+      // Set before the call, not after: once it is in flight the order may
+      // exist whatever comes back, and that is what makes a retry unsafe.
+      if(progress)progress.submitted=true;
+      const entry=await adapter.submitMarketEntry(plan as unknown as Record<string,unknown>,{skipProtection:false});
+      legs.push({symbol:plan.venueSymbol!,entryId:entry.id});
+      if(progress)progress.legs.push({symbol:plan.venueSymbol!,entryId:entry.id});
+      leg.entryId=entry.id;leg.quantity=entry.quantity;
+    }catch(error){
+      leg.error=error instanceof Error?error.message:String(error);
+    }
+    report.push(leg);
+    await notify("gainers_leg",leg);
+  }
+  const platform=adapter instanceof BinanceFuturesAdapter?"binance":"variational";
+  await notify("gainers_basket",{mode,basket:BASKET,marginLong:margins.long,marginShort:margins.short,matched:report,unmatched,longs:longs.length,shorts:shorts.length,skew,leverage:LEVERAGE,lookbackHours:LOOKBACK_HOURS,platform});
+  return legs;
+}
+
+/**
+ * Flattens the account and reports every position it touched.
+ *
+ * Closing only the legs this process opened left anything placed by hand
+ * running past the exit — so the operator asked for the whole account, which
+ * also removes the bookkeeping that made a manual position a hazard.
+ *
+ * Returns the legs still open, so a refused close keeps its id and is retried.
+ */
+async function closeGainersLegs(legs:GainersLeg[],mode:"测试"|"正式",openedAt?:number){
+  if(!adapter.closeAllPositions)throw new Error("当前 adapter 无法平仓（Variational 未启用）");
+  const closed=await adapter.closeAllPositions();
+  const platform=adapter instanceof BinanceFuturesAdapter?"binance":"variational";
+
+  // A leg that hit its take-profit closed itself hours ago and is no longer a
+  // position, so the sweep above cannot report it. Left out, its profit is
+  // absent from the Telegram summary and from every P&L total derived from it
+  // — a winning night read as a losing one.
+  //
+  // Both kinds of leg are then priced the same way, from the fills over the
+  // basket's window: the sweep only sees its own closing order, so it charged
+  // the exit commission and not the entry's, and two legs in one message
+  // adding up under different rules is a number nobody can check.
+  const report:Array<Record<string,unknown>>=[...closed];
+  if(openedAt&&adapter instanceof BinanceFuturesAdapter){
+    const settled=new Set(closed.map((c)=>c.symbol));
+    for(const leg of legs)if(!settled.has(leg.symbol))report.push({symbol:leg.symbol,ok:true,exitReason:"止盈/止损"});
+
+    // Funding settles on the venue's clock, never inside a trade, so it has to
+    // be fetched separately — and it is the larger number of the two costs over
+    // an eight-hour hold. One call covers every leg.
+    let funding=new Map<string,number>();
+    try{funding=await adapter.fundingSince(openedAt,Date.now());}
+    catch(error){
+      await recordBusinessError({service:"variational-agent",code:"GAINERS_FUNDING_LOOKUP_FAILED",
+        message:error instanceof Error?error.message:String(error)});
+    }
+
+    for(const entry of report){
+      if(!entry.ok)continue;
+      try{
+        // Up to four tries: the legs closed seconds ago and the venue indexes
+        // their fills a beat later, so the first answer is often empty.
+        const result=await adapter.realizedSince(`${String(entry.symbol)}USDT`,openedAt,4);
+        if(result)Object.assign(entry,result);
+      }catch(error){
+        await recordBusinessError({service:"variational-agent",code:"GAINERS_PNL_LOOKUP_FAILED",
+          message:`${String(entry.symbol)}: ${error instanceof Error?error.message:String(error)}`});
+      }
+      // Net is what the wallet actually did: the price move, plus funding
+      // received or paid, less commission. Leaving funding out reported a
+      // night as +43.71 when the balance had moved +59.19.
+      const fee=funding.get(String(entry.symbol));
+      if(fee!==undefined)entry.funding=fee;
+      // Only when the price move is actually known. Netting funding against an
+      // absent gross reports the funding as the whole result — three legs came
+      // back as "−0.02, −0.37, −1.05" on a night they had moved −48, −12 and +17.
+      if(entry.grossPnl!=null&&entry.commission!=null)
+        entry.realizedPnl=Number(entry.grossPnl)+(fee??0)-Number(entry.commission);
+      else delete entry.realizedPnl;
+    }
+  }
+
+  // Which trading day this is, counted from the record rather than a constant:
+  // one Asia/Shanghai date per scheduled basket closed on the venue, today
+  // included whether or not its row exists yet.
+  let tradingDay:number|undefined;
+  if(mode==="正式"&&platform==="binance"){
+    try{
+      tradingDay=Number((await query<{n:string}>(`SELECT count(DISTINCT d)::text n FROM (
+        SELECT (created_at AT TIME ZONE 'Asia/Shanghai')::date d FROM outbox
+        WHERE topic='notification.gainers_closed' AND payload->>'platform'='binance' AND payload->>'mode'='正式'
+          AND jsonb_array_length(coalesce(payload->'closed','[]'::jsonb))>0
+        UNION SELECT (now() AT TIME ZONE 'Asia/Shanghai')::date) x`)).rows[0]?.n);
+    }catch{/* the day number is a nicety; never hold up the close report for it */}
+  }
+
+  // Read after the exits settle, so it is the balance the basket left behind.
+  let balanceUsdc:number|undefined;
+  try{balanceUsdc=(await adapter.account()).balanceUsdc;}
+  catch{/* same — a missing balance just drops that line */}
+
+  await notify("gainers_closed",{mode,closed:report,scope:"账户全部持仓",platform,tradingDay,balanceUsdc});
+  // Only what the sweep failed to close is carried forward — including
+  // positions that were never tracked. Filtering to the tracked legs alone
+  // would drop an untracked failure on the floor and stop retrying it. The
+  // early-exit entries are all settled, so they are never retried.
+  return closed.filter((c)=>!c.ok).map((c)=>({symbol:c.symbol,entryId:""}));
+}
+
+/**
+ * The manual test button, as a state machine in app_state.
+ *
+ * The API cannot reach Variational — only this process holds the browser
+ * session — so the button writes an intent and the agent acts on it. Requests
+ * are cleared before the venue call, not after: a crash mid-open must not
+ * leave a START_REQUESTED that opens a second basket on the next tick.
+ */
+/**
+ * Mirrors the venue's open positions into app_state every tick.
+ *
+ * /pos reads orders WHERE state='FILLED_OPEN', and the gainers basket never
+ * writes an orders row — it holds nothing but leg ids — so the command showed
+ * an empty book while three positions were open. Only this process can see the
+ * venue, so it publishes what it sees and the bot reads that.
+ */
+async function publishGainersPositions(){
+  if(!adapter.livePositions)return;
+  try{
+    const positions=await adapter.livePositions();
+    const state=await readGainers();
+    await writeGainers({...state,positions,positionsAt:new Date().toISOString()});
+  }catch{/* a failed snapshot leaves the previous one, stamped with its own time */}
+}
+
+/**
+ * Tops the short side back up to BASKET, on operator request.
+ *
+ * Exists because a bug rejected every short leg on 2026-08-12 and left the
+ * account directional with the operator away from their desk. Skips any coin
+ * already held in either direction: Variational nets per instrument, so opening
+ * a short against an existing long would quietly reduce that long instead of
+ * hedging it.
+ *
+ * The request is cleared before the venue is touched — a crash mid-fill must
+ * not leave a REQUESTED that opens a second round on the next tick.
+ */
+async function runFillShorts(){
+  const state=await readGainers();
+  const request=state.fillShorts;
+  if(!request||request.state!=="REQUESTED")return;
+  if(LONG_WEIGHT>=1){
+    await writeGainers({...state,fillShorts:{state:"DONE"}});
+    return;
+  }
+  await writeGainers({...state,fillShorts:{...request,state:"RUNNING"}});
+  try{
+    if(!adapter.livePositions||!adapter.supportedAssets||!adapter.submitMarketEntry)throw new Error("Variational 未启用");
+    const open=await adapter.livePositions();
+    const held=new Set(open.map((p)=>p.symbol));
+    const shortCount=open.filter((p)=>p.qty<0).length;
+    const missing=BASKET-shortCount;
+    if(missing<=0){
+      await notify("gainers_basket",{mode:"补单",basket:BASKET,matched:[],unmatched:[],
+        error:`当前已有 ${shortCount} 条空单，无需补齐。`});
+      await writeGainers({...(await readGainers()),fillShorts:{state:"DONE"}});
+      return;
+    }
+    const account=await adapter.account();
+    const aliases=aliasesFrom((await query<{binance_symbol:string;variational_url:string}>("SELECT binance_symbol,variational_url FROM assets")).rows);
+    const [ranked,venueRaw]=await Promise.all([binanceGainers(),adapter.supportedAssets()]);
+    const {shorts,unmatched}=selectPair(ranked,parseVenueAssets(venueRaw),aliases);
+    const shortPerLeg=state.marginUsdc&&state.marginUsdc>0?state.marginUsdc
+      :account.balanceUsdc*DEPLOY_FRACTION*(1-LONG_WEIGHT)/BASKET;
+    const candidates=shorts.filter((p)=>!held.has(p.base)).slice(0,missing);
+    const report:Array<Record<string,unknown>>=[];
+    const opened:GainersLeg[]=[];
+    for(const plan of buildPlans(candidates,{long:shortPerLeg,short:shortPerLeg})){
+      const pick=candidates.find((c)=>c.base===plan.venueSymbol)!;
+      const leg:Record<string,unknown>={mode:"补单",base:pick.base,direction:"SHORT",changePercent:pick.changePercent,margin:plan.marginUsdc,entryPrice:plan.entryPrice,stopLoss:plan.stopLoss,takeProfit:plan.takeProfit};
+      try{
+        const floor=await adapter.minimumMargin(plan);
+        if(floor>plan.marginUsdc*1.05)throw new Error(`平台最低名义 ${floor.toFixed(2)} 超过计划的 ${plan.marginUsdc.toFixed(2)}`);
+        const entry=await adapter.submitMarketEntry(plan as unknown as Record<string,unknown>,{skipProtection:false});
+        opened.push({symbol:plan.venueSymbol!,entryId:entry.id});
+        leg.entryId=entry.id;leg.quantity=entry.quantity;
+      }catch(error){leg.error=error instanceof Error?error.message:String(error);}
+      report.push(leg);
+      await notify("gainers_leg",leg);
+    }
+    await notify("gainers_basket",{mode:"补单",basket:BASKET,marginShort:shortPerLeg,matched:report,unmatched,
+      longs:open.filter((p)=>p.qty>0).length,shorts:shortCount+opened.length});
+    const after=await readGainers();
+    await writeGainers({...after,open:[...(after.open??[]),...opened],fillShorts:{state:"DONE"}});
+  }catch(error){
+    await writeGainers({...(await readGainers()),fillShorts:{state:"DONE"}});
+    await notify("gainers_basket",{mode:"补单",basket:BASKET,matched:[],unmatched:[],
+      error:error instanceof Error?error.message:String(error)});
+  }
+}
+
+async function runGainersTest(){
+  const state=await readGainers();
+  const test=state.test;
+  if(!test||test.state==="IDLE"||test.state==="RUNNING")return;
+
+  if(test.state==="START_REQUESTED"){
+    await writeGainers({...state,test:{...test,state:"RUNNING",legs:[],startedAt:new Date().toISOString()}});
+    try{
+      let perLeg=test.marginUsdc??10;
+      if(adapter instanceof BinanceFuturesAdapter){
+        const account=await adapter.account();
+        perLeg=account.balanceUsdc*0.10/BASKET;
+      }
+      const legs=await openGainersBasket(perLeg,"测试");
+      const after=await readGainers();
+      await writeGainers({...after,test:{...after.test!,state:"RUNNING",legs}});
+    }catch(error){
+      const after=await readGainers();
+      await writeGainers({...after,test:{state:"IDLE"}});
+      await notify("gainers_basket",{mode:"测试",basket:BASKET,matched:[],unmatched:[],error:error instanceof Error?error.message:String(error)});
+    }
+    return;
+  }
+
+  // STOP_REQUESTED
+  const stuck=await closeGainersLegs(test.legs??[],"测试",test.startedAt?Date.parse(test.startedAt):undefined);
+  const after=await readGainers();
+  // Legs that would not close keep the test RUNNING so the next stop retries;
+  // reporting IDLE with positions still open is the one lie that matters here.
+  await writeGainers({...after,test:stuck.length?{...after.test!,state:"RUNNING",legs:stuck}:{state:"IDLE"}});
+}
+
+/**
+ * Opens at 22:00 UTC+8 and closes at 07:00 UTC+8, driven off the 30s tick.
+ *
+ * The close time is written down when the basket opens rather than recomputed
+ * each tick: if the agent is down across the exit, it must still close on the
+ * next tick it gets, and a rule expressed as "when the clock says 23:00" would
+ * simply miss the window and hold the positions another day.
+ *
+ * The open, by contrast, is deliberately not caught up indefinitely. An entry
+ * placed at 20:00 UTC is a three-hour hold, which is a different strategy from
+ * the nine-hour one that was measured, so a missed window is skipped and said
+ * out loud.
+ */
+async function runGainersSchedule(){
+  const state=await readGainers();
+  if(!state.enabled)return;
+  // Never run the nightly basket on top of a manual test — one balance, one
+  // set of positions, and the test's legs are closed by the button, not the clock.
+  if(state.test&&state.test.state!=="IDLE")return;
+  const now=new Date(),day=now.toISOString().slice(0,10);
+  const openAt=Date.UTC(now.getUTCFullYear(),now.getUTCMonth(),now.getUTCDate(),OPEN_HOUR_UTC,OPEN_MINUTE_UTC,0);
+
+  if(state.closeAt&&now.getTime()>=new Date(state.closeAt).getTime()){
+    // closeAt is the entry plus the hold, so walking it back gives the window
+    // the early-exit lookup needs.
+    const basketOpenedAt=new Date(state.closeAt).getTime()-HOLD_HOURS*3_600_000;
+    const stuck=await closeGainersLegs(state.open??[],"正式",basketOpenedAt);
+    await writeGainers({...state,open:stuck,closeAt:stuck.length?state.closeAt:undefined});
+    return;
+  }
+  if(state.closeAt)return;                                  // a basket is running
+  if(state.lastOpenDay===day)return;                        // already handled today
+  if(now.getTime()<openAt)return;
+  // Two hours of catch-up covers a restart; beyond that the hold would be so
+  // much shorter than the measured eight that it is a different strategy, so
+  // the day is skipped and said out loud.
+  if(now.getTime()>=openAt+2*3_600_000){
+    await writeGainers({...state,lastOpenDay:day});
+    await notify("gainers_basket",{mode:"正式",basket:BASKET,matched:[],unmatched:[],
+      error:`错过 UTC ${OPEN_HOUR_UTC}:${String(OPEN_MINUTE_UTC).padStart(2,"0")} 入场窗口（现在 ${now.toISOString().slice(11,16)} UTC），今日跳过。`});
+    return;
+  }
+
+  // The day is claimed BEFORE the venue call, so a failure part-way through
+  // can never let the next tick open a second basket for the same night.
+  await writeGainers({...state,lastOpenDay:day});
+  const progress:OpenProgress={submitted:false,legs:[]};
+  try{
+    const inserted=await refreshKlines();
+    console.log(`klines refreshed: +${inserted} bars`);
+    const legs=await openGainersBasket(state.marginUsdc??null,"正式",progress);
+    // Start plus duration, so the exit needs no day-rollover reasoning, and a
+    // late catch-up still exits on the schedule the strategy was measured on.
+    const closeAt=new Date(openAt+HOLD_HOURS*3_600_000).toISOString();
+    const after=await readGainers();
+    await writeGainers({...after,closeAt:legs.length?closeAt:undefined,open:legs});
+  }catch(error){
+    const after=await readGainers();
+    if(progress.submitted){
+      // Orders went out and something after them failed. Retrying would stack a
+      // second basket on the first, so the day stays claimed — but the legs are
+      // recorded regardless, or the exit would never run and they would sit open
+      // past the hold with nothing tracking them.
+      await writeGainers({...after,closeAt:progress.legs.length?new Date(openAt+HOLD_HOURS*3_600_000).toISOString():undefined,open:progress.legs});
+    }else{
+      // Nothing reached the venue — a rejected account read, a ranking that
+      // could not be built. Releasing the day lets the catch-up window try
+      // again in thirty seconds instead of writing the night off, which is how
+      // one transient timeout used to cost a whole basket.
+      await writeGainers({...after,lastOpenDay:state.lastOpenDay});
+    }
+    // Retries run every tick until the catch-up window closes; announcing each
+    // one would be dozens of identical messages. The first failure of the night
+    // is reported, and the window's own expiry notice covers giving up.
+    const message=error instanceof Error?error.message:String(error);
+    if(after.openErrorDay!==day){
+      await writeGainers({...(await readGainers()),openErrorDay:day});
+      await notify("gainers_basket",{mode:"正式",basket:BASKET,matched:[],unmatched:[],error:message,willRetry:!progress.submitted});
+    }
+  }
+}
+
 async function tick(){
-  const previousSession=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='variational_session'")).rows[0]?.value??{};
-  const valid=await adapter.sessionValid();
-  const discoveryComplete=config.VARIATIONAL_ADAPTER_MODE==="browser-fetch";
-  if(previousSession.loggedIn&&!valid)await query("INSERT INTO outbox(topic,payload) VALUES('notification.variational_session_lost',$1)",[JSON.stringify({detectedAt:new Date().toISOString()})]);
-  const accountError=valid?await refreshAccount():undefined;
-  const reconciliationError=valid?await reconcileOpenOrders():undefined;
-  if(valid)await backfillReversalDetails();
-  const reconciled=valid&&(Boolean(previousSession.reconciled)||!reconciliationError);
-  await query("UPDATE app_state SET value=$1,updated_at=now() WHERE key='variational_session'",[JSON.stringify({loggedIn:valid,discoveryComplete,reconciled})]);
+  const isBinance=adapter instanceof BinanceFuturesAdapter;
+
+  let valid:boolean;
+  let reconciled:boolean;
+  let accountError:unknown;
+  let reconciliationError:unknown;
+
+  if(isBinance){
+    valid=await adapter.sessionValid();
+    accountError=valid?await refreshAccount():undefined;
+    reconciled=true;
+    reconciliationError=undefined;
+  }else{
+    const previousSession=(await query<{value:Record<string,unknown>}>("SELECT value FROM app_state WHERE key='variational_session'")).rows[0]?.value??{};
+    valid=await adapter.sessionValid();
+    const discoveryComplete=config.VARIATIONAL_ADAPTER_MODE==="browser-fetch";
+    if(previousSession.loggedIn&&!valid)await query("INSERT INTO outbox(topic,payload) VALUES('notification.variational_session_lost',$1)",[JSON.stringify({detectedAt:new Date().toISOString()})]);
+    accountError=valid?await refreshAccount():undefined;
+    reconciliationError=valid?await reconcileOpenOrders():undefined;
+    if(valid)await backfillReversalDetails();
+    reconciled=valid&&(Boolean(previousSession.reconciled)||!reconciliationError);
+    await query("UPDATE app_state SET value=$1,updated_at=now() WHERE key='variational_session'",[JSON.stringify({loggedIn:valid,discoveryComplete,reconciled})]);
+  }
+
   const item=await claimWork();
   if(item){
     const submitReady=valid&&reconciled&&config.LIVE_TRADING_ENABLED;
@@ -866,9 +1272,19 @@ async function tick(){
     }else if(item.topic==="order.close_opposite")await handleCloseOpposite(item,valid&&reconciled);
     else await handleControl(item);
   }
-  if(!valid||!config.LIVE_TRADING_ENABLED){await recordHealth("variational-agent",false,!valid?"Variational session invalid":"Live trading disabled",true);return;}
+  // Three polls — a minute and a half — before the venue counts as down. The
+  // adapter already retries each call once, so reaching this means several
+  // round trips in a row failed, which a passing blip does not do.
+  const degradeAfter=3;
+  if(!valid||!config.LIVE_TRADING_ENABLED){
+    const reason=!valid
+      ?adapter instanceof BinanceFuturesAdapter?`Binance API unreachable: ${adapter.lastSessionError??"unknown"}`:"Variational session invalid"
+      :"Live trading disabled";
+    await recordHealth("variational-agent",false,reason,true,true,degradeAfter);
+    return;
+  }
   const readError=accountError??reconciliationError;
-  await recordHealth("variational-agent",!readError,readError,false);
+  await recordHealth("variational-agent",!readError,readError,false,true,degradeAfter);
 }
 
 async function recoverInterruptedWork(){
@@ -898,6 +1314,12 @@ while(true){
   // a fresh process, since config is read once and cached at startup; exit
   // and let launchd/Docker's restart policy relaunch with the current .env.
   if(await claimRestartRequest("variational-agent")){await shutdown();}
-  try{await tick();}catch(error){await recordHealth("variational-agent",false,error,true);}
+  // Same three-poll threshold as the checks inside tick(), so a throw from a
+  // dropped request does not degrade the service where a returned failure would not.
+  try{await tick();}catch(error){await recordHealth("variational-agent",false,error,true,true,3);}
+  try{await publishGainersPositions();}catch(error){await recordBusinessError({service:"variational-agent",code:"GAINERS_SNAPSHOT_FAILED",message:error instanceof Error?error.message:String(error)});}
+  try{await runFillShorts();}catch(error){await recordBusinessError({service:"variational-agent",code:"GAINERS_FILL_FAILED",message:error instanceof Error?error.message:String(error)});}
+  try{await runGainersTest();}catch(error){await recordBusinessError({service:"variational-agent",code:"GAINERS_TEST_FAILED",message:error instanceof Error?error.message:String(error)});}
+  try{await runGainersSchedule();}catch(error){await recordBusinessError({service:"variational-agent",code:"GAINERS_SCHEDULE_FAILED",message:error instanceof Error?error.message:String(error)});}
   await sleep(fixedRules.variationalPollMs);
 }

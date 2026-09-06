@@ -1,7 +1,7 @@
 import { describe,expect,it } from "vitest";
 import {
   formatAssetResumed,formatBreakevenStopFailed,formatDirectionHalted,formatClosed,formatEntryFilled,formatGeneric,formatMarginPauseResume,
-  formatOrderCreated,formatOrderFailed,formatScaledOut,formatServiceRecovered,formatSessionLost,formatSignal,formatSystemError
+  formatGainersBasket as formatGainersBasketFn,formatGainersClosed as formatGainersClosedFn,formatOrderCreated,formatOrderFailed,formatScaledOut,formatServiceRecovered,formatSessionLost,formatSignal,formatSystemError
 } from "./format.js";
 import { formatAccount,formatPlans,formatPnl,formatPositions,formatStatus,formatWorkingOrders,parseCommand } from "./commands.js";
 
@@ -148,7 +148,7 @@ describe("chat commands",()=>{
   });
 
   it("flags an account that has auto-paused on margin",()=>{
-    const text=formatAccount({balanceUsdc:271.64,marginUsagePercent:84.3,autoPaused:true,loggedIn:true,reconciled:true,openPositions:2,workingOrders:10});
+    const text=formatAccount({balanceUsdc:271.64,marginUsagePercent:84.3,autoPaused:true,connected:true,openPositions:2,workingOrders:10});
     expect(text).toContain("84.3%");
     expect(text).toContain("自动暂停开新仓");
   });
@@ -253,5 +253,163 @@ describe("formatWorkingOrders separates virtual entries from posted ones",()=>{
     expect(text).toContain("等待到价");
     expect(text).toContain("确认中");
     expect(text).toContain("平台挂单");
+  });
+});
+
+describe("formatGainersClosed",()=>{
+  const leg=(over:Record<string,unknown>)=>({ok:true,qty:100,entryPrice:0.00457501985085415,exitPrice:0.0046511454,realizedPnl:4.06,...over});
+
+  it("never prints a missing exit price as the word null",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[leg({exitPrice:null})]});
+    expect(text).not.toContain("null");
+    expect(text).toContain("→ ?");
+  });
+
+  it("trims venue float noise down to readable precision",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[leg({})]});
+    expect(text).toContain("0.00457502 → 0.00465115");
+    expect(text).not.toContain("0.00457501985085415");
+  });
+
+  it("counts a leg that closed itself on take-profit into the total",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[
+      leg({symbol:"BMT",realizedPnl:-28.45}),
+      leg({symbol:"ONG",realizedPnl:75.94,exitReason:"止盈/止损"})
+    ]});
+    expect(text).toContain("[止盈/止损]");
+    expect(text).toContain("2/2 成功");
+    expect(text).toContain("已实现合计 +47.49 USDC");
+  });
+
+  it("still flags legs whose P&L never came back rather than scoring them zero",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[
+      leg({symbol:"A",realizedPnl:10}),
+      leg({symbol:"B",realizedPnl:undefined})
+    ]});
+    expect(text).toContain("盈亏未知");
+    expect(text).toContain("1 笔盈亏未取到，未计入");
+  });
+});
+
+describe("formatGainersClosed 拆分显示",()=>{
+  const leg=(over:Record<string,unknown>)=>({ok:true,qty:100,entryPrice:1,exitPrice:1.1,grossPnl:10,commission:0.25,realizedPnl:9.75,...over});
+
+  it("每条腿下面列出涨跌与手续费，并给出拆分合计",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[
+      leg({symbol:"ONG",grossPnl:76.24,commission:0.30,realizedPnl:75.94}),
+      leg({symbol:"BMT",grossPnl:-28.20,commission:0.25,realizedPnl:-28.45})
+    ]});
+    expect(text).toContain("涨跌 +76.24   手续费 -0.30");
+    expect(text).toContain("涨跌 -28.20   手续费 -0.25");
+    expect(text).toContain("已实现合计 +47.49 USDC");
+    expect(text).toContain("涨跌 +48.04   手续费 -0.55");
+  });
+
+  it("手续费永远带负号，不会被读成收入",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[leg({commission:0.42})]});
+    expect(text).toContain("手续费 -0.42");
+    expect(text).not.toContain("手续费 +0.42");
+  });
+
+  it("旧记录没有拆分字段时只显示净额，不伪造零手续费",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[
+      {ok:true,qty:100,entryPrice:1,exitPrice:1.1,realizedPnl:9.75,symbol:"OLD"}
+    ]});
+    expect(text).toContain("已实现合计 +9.75 USDC");
+    expect(text).not.toContain("涨跌盈亏");
+    expect(text).not.toContain("手续费");
+  });
+
+  it("新旧混合时标注有几笔没有拆分数据",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[
+      leg({symbol:"NEW"}),
+      {ok:true,qty:50,realizedPnl:-1,symbol:"OLD"}
+    ]});
+    expect(text).toContain("1 笔无拆分数据");
+  });
+});
+
+describe("formatGainersClosed 资金费用",()=>{
+  it("逐腿与合计都显示资金费，收到为正、付出为负",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[
+      {ok:true,symbol:"ONG",qty:1618,entryPrice:0.16,exitPrice:0.2075,grossPnl:76.24,funding:15.571,commission:0.30,realizedPnl:91.511},
+      {ok:true,symbol:"BTR",qty:1885,entryPrice:0.1378,exitPrice:0.1338,grossPnl:-7.58,funding:-0.582,commission:0.26,realizedPnl:-8.422}
+    ]});
+    expect(text).toContain("资金费 +15.57");
+    expect(text).toContain("资金费 -0.58");
+    expect(text).toContain("涨跌 +68.66   资金费 +14.99   手续费 -0.56");
+    expect(text).toContain("已实现合计 +83.09 USDC");
+  });
+
+  it("没有资金费字段时不显示该项，也不当成零计入逐腿明细",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",closed:[
+      {ok:true,symbol:"X",qty:10,grossPnl:5,commission:0.1,realizedPnl:4.9}
+    ]});
+    expect(text).toContain("涨跌 +5.00   手续费 -0.10");
+    expect(text).not.toContain("资金费 +0.00   手续费 -0.10");
+  });
+});
+
+describe("formatGainersClosed 交易天数与余额",()=>{
+  const leg={ok:true,symbol:"ONG",qty:100,entryPrice:1,exitPrice:1.1,grossPnl:10,funding:2,commission:0.25,realizedPnl:11.75};
+
+  it("标题带上第几个交易日，末尾给出账户余额",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",tradingDay:5,balanceUsdc:611.2843,closed:[leg]});
+    expect(text).toContain("第 5 天");
+    expect(text).toContain("账户余额 611.28 USDC");
+  });
+
+  it("缺少这两项时不显示，也不打印 undefined",()=>{
+    const text=formatGainersClosedFn({mode:"测试",platform:"binance",closed:[leg]});
+    expect(text).not.toContain("第");
+    expect(text).not.toContain("账户余额");
+    expect(text).not.toContain("undefined");
+  });
+
+  it("余额为 0 仍然显示，不被当作缺失",()=>{
+    const text=formatGainersClosedFn({mode:"正式",platform:"binance",tradingDay:1,balanceUsdc:0,closed:[leg]});
+    expect(text).toContain("账户余额 0.00 USDC");
+  });
+});
+
+describe("formatGainersBasket 开仓失败后的重试提示",()=>{
+  it("还没下过单时告知会继续重试",()=>{
+    const t=formatGainersBasketFn({mode:"正式",basket:4,matched:[],unmatched:[],error:"Binance GET /fapi/v2/account 408",willRetry:true});
+    expect(t).toContain("仍在补开");
+    expect(t).toContain("408");
+  });
+  it("已经发出订单时明确不会重试",()=>{
+    const t=formatGainersBasketFn({mode:"正式",basket:4,matched:[],unmatched:[],error:"boom",willRetry:false});
+    expect(t).toContain("不会重试");
+    expect(t).not.toContain("仍在补开");
+  });
+  it("旧记录没有这个字段时不多打空行文案",()=>{
+    const t=formatGainersBasketFn({mode:"正式",basket:4,matched:[],unmatched:[],error:"boom"});
+    expect(t).not.toContain("仍在补开");
+    expect(t).not.toContain("不会重试");
+  });
+});
+
+describe("formatAccount 走实盘策略的数据源",()=>{
+  const base={balanceUsdc:932.36,marginUsagePercent:0,autoPaused:false,connected:true,workingOrders:0};
+
+  it("持有篮子时报出腿数和平仓时刻",()=>{
+    const t=formatAccount({...base,openPositions:4,closeAt:"2026-09-06T00:00:00.000Z"});
+    expect(t).toContain("持仓　　4 个");
+    expect(t).toContain("平仓");
+    expect(t).toContain("连接　　正常");
+  });
+
+  it("空仓时说无，而不是含糊的 0 个",()=>{
+    const t=formatAccount({...base,openPositions:0});
+    expect(t).toContain("持仓　　无");
+  });
+
+  it("agent 异常时给出原因，且不再出现 Variational 的登录字样",()=>{
+    const t=formatAccount({...base,openPositions:0,connected:false,connectionNote:"Binance API unreachable: 408"});
+    expect(t).toContain("⚠️ 异常");
+    expect(t).toContain("408");
+    expect(t).not.toContain("未登录");
+    expect(t).not.toContain("对账");
   });
 });
